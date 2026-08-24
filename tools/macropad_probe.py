@@ -25,13 +25,15 @@ or save anything on the device. The lighting test is opt-in and is not
 persisted, so unplugging the pad restores it.
 
 This file is standalone on purpose. Copy it anywhere, no other project files
-needed. Python 3.8 or newer plus the hidapi binding.
+needed, and on Linux no Python packages either: it talks to /dev/hidraw
+directly. Python 3.8 or newer.
 """
 import argparse
 import binascii
 import json
 import os
 import platform
+import select
 import sys
 import time
 
@@ -55,7 +57,7 @@ KNOWN_MOUNTAIN_PIDS = {
 }
 
 report = {
-    "probe_version": 1,
+    "probe_version": 2,
     "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     "environment": {},
     "mountain_devices": [],
@@ -89,17 +91,20 @@ def hexs(data):
 
 # ── HID report descriptor ─────────────────────────────────────────────────────
 
-def read_report_descriptor(hid_path):
+HIDRAW_CLASS = "/sys/class/hidraw"
+
+
+def read_report_descriptor(hid_path, base=None):
     """Read the raw report descriptor from sysfs. Linux and hidraw only.
 
-    hidapi paths look like /dev/hidraw3 on the hidraw backend; the descriptor
-    sits next to the device node in sysfs."""
+    Node paths look like /dev/hidraw3; the descriptor sits next to the device
+    node in sysfs. `base` exists so the tests can point this at a fake tree."""
     if isinstance(hid_path, bytes):
         hid_path = hid_path.decode(errors="replace")
     name = os.path.basename(hid_path)
     if not name.startswith("hidraw"):
         return None
-    sysfs = "/sys/class/hidraw/%s/device/report_descriptor" % name
+    sysfs = os.path.join(base or HIDRAW_CLASS, name, "device", "report_descriptor")
     try:
         with open(sysfs, "rb") as handle:
             return handle.read()
@@ -161,25 +166,147 @@ def summarise_descriptor(data):
 # ── enumeration ───────────────────────────────────────────────────────────────
 
 def import_hid():
+    """The hidapi binding, if this machine happens to have one.
+
+    Optional on purpose. On Linux the pad is a plain file under /dev/hidraw,
+    which we can open without any Python package, and that is the path this
+    script prefers. The binding is only a fallback for other systems."""
     try:
         import hid
         return hid
     except ImportError:
-        print("The hidapi Python binding is missing. Install it with one of:")
-        print("    pip install --user hid")
-        print("    sudo dnf install python3-hidapi        # Fedora")
-        print("    sudo apt install python3-hid           # Debian, Ubuntu")
-        print("    sudo pacman -S python-hidapi           # Arch")
         return None
 
 
-def scan(hid, vid, pid):
-    section("Mountain devices on this machine")
-    everything = []
+def describe_hid_module(module):
+    """Which of the packages called `hid` is installed here.
+
+    Two unrelated projects both install a module named `hid`: one exposes the
+    class `hid.Device`, the older one `hid.device()`. A tester whose distro
+    ships the second one got "module 'hid' has no attribute 'Device'" and the
+    probe stopped there, so the answer belongs in the report."""
+    if module is None:
+        return {"present": False}
+    info = {
+        "present": True,
+        "file": getattr(module, "__file__", None),
+        "version": str(getattr(module, "__version__", "") or "") or None,
+        "has_Device": hasattr(module, "Device"),
+        "has_device": hasattr(module, "device"),
+        "has_enumerate": hasattr(module, "enumerate"),
+    }
+    info["flavour"] = ("hid.Device" if info["has_Device"] else
+                       "hid.device" if info["has_device"] else "unusable")
+    return info
+
+
+def read_text(path):
     try:
-        everything = list(hid.enumerate(vid if vid else 0, 0))
+        with open(path) as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def hidraw_entries(vid, base=None):
+    """Enumerate the vendor's HID interfaces straight from sysfs.
+
+    Everything we need is already in the kernel's own bookkeeping: the vendor
+    and product in HID_ID, the interface number on the parent USB interface,
+    the report descriptor next to the node. /dev/hidrawN is then a file we
+    read and write like any other, so this path needs no Python package."""
+    base = base or HIDRAW_CLASS
+    if not os.path.isdir(base):
+        return []
+
+    def order(name):
+        tail = name[len("hidraw"):]
+        return int(tail) if tail.isdigit() else 0
+
+    out = []
+    for name in sorted(os.listdir(base), key=order):
+        if not name.startswith("hidraw"):
+            continue
+        device = os.path.join(base, name, "device")
+        fields = {}
+        for line in (read_text(os.path.join(device, "uevent")) or "").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                fields[key] = value
+        parts = (fields.get("HID_ID") or "").split(":")   # bus:vendor:product
+        if len(parts) != 3:
+            continue
+        try:
+            vendor, product = int(parts[1], 16), int(parts[2], 16)
+        except ValueError:
+            continue
+        if vid and vendor != vid:
+            continue
+
+        node = "/dev/" + name
+        entry = {
+            "vendor_id": vendor,
+            "product_id": product,
+            "path": node,
+            "source": "hidraw",
+            "sysfs": os.path.realpath(device),
+            "product_string": fields.get("HID_NAME"),
+            "manufacturer_string": None,
+            "interface_number": None,
+            "usage_page": 0,
+            "usage": 0,
+        }
+
+        walk = os.path.realpath(device)
+        for _ in range(4):                        # HID device, USB interface, ...
+            walk = os.path.dirname(walk)
+            number = read_text(os.path.join(walk, "bInterfaceNumber"))
+            if number is not None:
+                entry["interface_number"] = int(number, 16)
+                entry["usb_interface"] = os.path.basename(walk)
+                usb = os.path.dirname(walk)
+                entry["manufacturer_string"] = read_text(os.path.join(usb, "manufacturer"))
+                entry["product_string"] = (read_text(os.path.join(usb, "product"))
+                                           or entry["product_string"])
+                break
+
+        descriptor = read_report_descriptor(node, base)
+        if descriptor:
+            summary = summarise_descriptor(descriptor)
+            entry["usage_page"] = int(summary["usage_page"], 16)
+            entry["usage"] = int(summary["usage"], 16)
+        out.append(entry)
+    return out
+
+
+def library_entries(module, vid):
+    """The same list as seen by the hidapi binding, when there is one."""
+    if module is None or not hasattr(module, "enumerate"):
+        return []
+    try:
+        found = list(module.enumerate(vid or 0, 0))
     except Exception as exc:
-        print("  enumerate failed: %s" % exc)
+        note("enumerate through the hid module failed: %s" % exc)
+        return []
+    for entry in found:
+        entry["source"] = "library"
+    return found
+
+
+def path_text(path):
+    if isinstance(path, bytes):
+        return path.decode(errors="replace")
+    return "" if path is None else str(path)
+
+
+def scan(module, vid, pid, backend="auto"):
+    section("Mountain devices on this machine")
+    from_sysfs = hidraw_entries(vid) if backend in ("auto", "hidraw") else []
+    from_library = library_entries(module, vid) if backend in ("auto", "library") else []
+    everything = from_sysfs or from_library
+    report["backend"] = ("hidraw" if everything and everything[0].get("source") == "hidraw"
+                         else "library" if everything else "none")
+
     seen = {}
     for entry in everything:
         seen.setdefault(entry.get("product_id"), entry)
@@ -203,35 +330,58 @@ def scan(hid, vid, pid):
         print("  not connected")
         return []
     entries.sort(key=lambda e: e.get("interface_number") or 0)
+
+    # If both lists exist, remember the binding's path as a second way in: a
+    # libusb-backed binding can still reach the pad when /dev/hidraw refuses.
+    if from_sysfs and from_library:
+        for entry in entries:
+            for other in from_library:
+                if (other.get("product_id") == entry.get("product_id") and
+                        other.get("interface_number") == entry.get("interface_number")):
+                    entry["library_path"] = other.get("path")
+                    break
+
     for entry in entries:
-        path = entry.get("path")
-        path_text = path.decode(errors="replace") if isinstance(path, bytes) else str(path)
+        node = path_text(entry.get("path"))
         info = {
             "interface_number": entry.get("interface_number"),
             "usage_page": "0x%04X" % (entry.get("usage_page") or 0),
             "usage": "0x%02X" % (entry.get("usage") or 0),
-            "path": path_text,
+            "path": node,
+            "source": entry.get("source"),
             "release": entry.get("release_number"),
         }
-        descriptor = read_report_descriptor(path_text)
+        descriptor = read_report_descriptor(node)
         if descriptor:
             info["descriptor"] = hexs(descriptor)
             info["descriptor_summary"] = summarise_descriptor(descriptor)
-        readable = os.access(path_text, os.R_OK | os.W_OK) if path_text.startswith("/dev/") else None
-        info["writable"] = readable
+        writable = os.access(node, os.R_OK | os.W_OK) if node.startswith("/dev/") else None
+        info["writable"] = writable
+        entry["writable"] = writable
         report["interfaces"].append(info)
         print("  interface %-3s usage page %s usage %s  %s%s" % (
             info["interface_number"], info["usage_page"], info["usage"],
-            path_text, "" if readable is not False else "   (no permission)"))
+            node, "" if writable is not False else "   (no permission)"))
         if "descriptor_summary" in info:
             summary = info["descriptor_summary"]
             print("      descriptor: usage page %s usage %s, reports %s" % (
                 summary["usage_page"], summary["usage"], summary["reports"] or "{}"))
     if any(i.get("writable") is False for i in report["interfaces"]):
-        note("No write permission on at least one hidraw node. Either run this "
-             "with sudo or install the udev rule 99-mountain.rules from the "
-             "BaseCamp-Linux repository and replug the pad.")
+        permission_help(pid)
     return entries
+
+
+def permission_help(pid):
+    note("No write permission on at least one hidraw node.")
+    print()
+    print("  Either run this script once with sudo:")
+    print("      sudo python3 %s" % os.path.basename(sys.argv[0] or "macropad_probe.py"))
+    print("  or give your user access permanently and replug the pad:")
+    print("      echo 'SUBSYSTEM==\"hidraw\", ATTRS{idVendor}==\"%04x\", "
+          "ATTRS{idProduct}==\"%04x\", MODE=\"0666\", TAG+=\"uaccess\"' \\" % (VID, pid))
+    print("        | sudo tee /etc/udev/rules.d/99-mountain-probe.rules")
+    print("      sudo udevadm control --reload-rules && sudo udevadm trigger")
+    print()
 
 
 # ── device conversation ───────────────────────────────────────────────────────
@@ -239,27 +389,14 @@ def scan(hid, vid, pid):
 class Link:
     """One open HID interface, with reads that keep what they cannot use."""
 
-    def __init__(self, hid, entry):
-        self.entry = entry
-        self.dev = hid.Device(path=entry["path"])
-        self.dev.nonblocking = False
-        self.spare = []
-
     def close(self):
-        try:
-            self.dev.close()
-        except Exception:
-            pass
+        raise NotImplementedError
 
     def write(self, payload):
-        self.dev.write(b"\x00" + bytes(payload))
+        raise NotImplementedError
 
     def read(self, timeout_ms):
-        try:
-            data = self.dev.read(PAYLOAD_LEN, timeout=timeout_ms)
-        except Exception:
-            return None
-        return bytes(data) if data else None
+        raise NotImplementedError
 
     def ask(self, payload, timeout_ms=700):
         """Send, then collect replies until the timeout. Returns them all,
@@ -278,7 +415,119 @@ class Link:
         return replies
 
 
-def try_handshake(hid, entries, forced_interface=None):
+class HidrawLink(Link):
+    """The kernel node, opened directly. No Python binding involved.
+
+    Writes carry the report number in front of the payload, which is what
+    hidraw expects and what hidapi does for us elsewhere; report 0 means the
+    device does not number its reports and the kernel drops the byte again."""
+
+    kind = "hidraw"
+
+    def __init__(self, entry):
+        self.path = path_text(entry.get("path"))
+        self.fd = os.open(self.path, os.O_RDWR)
+        self.poller = select.poll()
+        self.poller.register(self.fd, select.POLLIN)
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def write(self, payload):
+        os.write(self.fd, b"\x00" + bytes(payload))
+
+    def read(self, timeout_ms):
+        if not self.poller.poll(max(0, int(timeout_ms))):
+            return None
+        try:
+            data = os.read(self.fd, PAYLOAD_LEN + 1)
+        except OSError:
+            return None
+        return bytes(data) if data else None
+
+
+class LibraryLink(Link):
+    """The hidapi binding, either flavour of it."""
+
+    kind = "library"
+
+    def __init__(self, module, entry, path=None):
+        raw = path if path is not None else entry.get("path")
+        self.path = path_text(raw)
+        opened = raw if isinstance(raw, bytes) else self.path.encode()
+        if hasattr(module, "Device"):
+            self.dev = module.Device(path=opened)
+            self.kind = "hid.Device"
+            try:
+                self.dev.nonblocking = False
+            except Exception:
+                pass
+        elif hasattr(module, "device"):
+            self.dev = module.device()
+            self.dev.open_path(opened)
+            self.kind = "hid.device"
+            try:
+                self.dev.set_nonblocking(0)
+            except Exception:
+                pass
+        else:
+            raise RuntimeError("the installed hid module offers neither "
+                               "Device nor device()")
+
+    def close(self):
+        try:
+            self.dev.close()
+        except Exception:
+            pass
+
+    def write(self, payload):
+        self.dev.write(b"\x00" + bytes(payload))
+
+    def read(self, timeout_ms):
+        try:
+            data = self.dev.read(PAYLOAD_LEN, int(timeout_ms))
+        except TypeError:                     # binding without a timeout argument
+            try:
+                data = self.dev.read(PAYLOAD_LEN)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        return bytes(data) if data else None
+
+
+def open_link(module, entry):
+    """Open an interface the best way this machine allows.
+
+    Tries the kernel node first and the binding second, and reports every
+    attempt, so a failure says which door was locked rather than just that
+    something went wrong."""
+    attempts = []
+    if entry.get("source") == "hidraw" and entry.get("path"):
+        attempts.append(("hidraw", lambda: HidrawLink(entry)))
+    if module is not None:
+        for candidate in (entry.get("library_path"),
+                          entry.get("path") if entry.get("source") == "library" else None):
+            if candidate:
+                attempts.append(("hid module",
+                                 lambda c=candidate: LibraryLink(module, entry, c)))
+                break
+    if not attempts:
+        raise RuntimeError("no way to open this interface: no /dev/hidraw node "
+                           "and no usable hid module")
+    errors = []
+    for name, opener in attempts:
+        try:
+            return opener()
+        except Exception as exc:
+            errors.append("%s: %s" % (name, exc))
+    raise RuntimeError("; ".join(errors))
+
+
+def try_handshake(module, entries, forced_interface=None):
     """Send the handshake to each candidate interface, see which one answers.
 
     On the DisplayPad this exact packet is answered with an echo of its first
@@ -286,20 +535,28 @@ def try_handshake(hid, entries, forced_interface=None):
     back is worth recording."""
     section("Handshake")
     winner = None
+    denied = False
     for entry in entries:
         number = entry.get("interface_number")
         if forced_interface is not None and number != forced_interface:
             continue
-        path = entry.get("path")
-        path_text = path.decode(errors="replace") if isinstance(path, bytes) else str(path)
-        result = {"interface_number": number, "path": path_text}
+        result = {"interface_number": number, "path": path_text(entry.get("path"))}
         try:
-            link = Link(hid, entry)
+            link = open_link(module, entry)
+        except PermissionError as exc:
+            denied = True
+            result["error"] = str(exc)
+            print("  interface %-3s no permission: %s" % (number, exc))
+            report["handshake"].append(result)
+            continue
         except Exception as exc:
+            if "permission" in str(exc).lower():
+                denied = True
             result["error"] = str(exc)
             print("  interface %-3s cannot open: %s" % (number, exc))
             report["handshake"].append(result)
             continue
+        result["opened_with"] = link.kind
         try:
             replies = link.ask(INIT_PACKET)
             result["replies"] = [hexs(r) for r in replies]
@@ -314,7 +571,7 @@ def try_handshake(hid, entries, forced_interface=None):
                 else:
                     link.close()
             else:
-                print("  interface %-3s silent" % number)
+                print("  interface %-3s silent  (via %s)" % (number, link.kind))
                 link.close()
         except Exception as exc:
             result["error"] = str(exc)
@@ -322,9 +579,14 @@ def try_handshake(hid, entries, forced_interface=None):
             link.close()
         report["handshake"].append(result)
     if winner is None:
-        print("  no interface answered. The pad may need a replug, or another")
-        print("  program (Base Camp under Wine, an earlier run of this script)")
-        print("  may still hold it.")
+        if denied or any(e.get("writable") is False for e in entries):
+            print("  every attempt was refused before it reached the pad, which")
+            print("  is a permission problem, not a protocol one.")
+            permission_help(entries[0].get("product_id") if entries else PID)
+        else:
+            print("  no interface answered. The pad may need a replug, or another")
+            print("  program (Base Camp under Wine, an earlier run of this script)")
+            print("  may still hold it.")
     return winner
 
 
@@ -528,6 +790,10 @@ def main():
                         help="skip the key capture")
     parser.add_argument("--dry-run", action="store_true",
                         help="list interfaces only, never open or write")
+    parser.add_argument("--backend", choices=("auto", "hidraw", "library"),
+                        default="auto",
+                        help="how to reach the pad: the kernel node, the hidapi "
+                             "binding, or whichever works (default)")
     parser.add_argument("--out", default=None, help="where to write the report")
     args = parser.parse_args()
 
@@ -541,10 +807,17 @@ def main():
     }
 
     hid = import_hid()
-    if hid is None:
+    report["environment"]["hid_module"] = describe_hid_module(hid)
+    if hid is None and not os.path.isdir(HIDRAW_CLASS):
+        print()
+        print("No /dev/hidraw on this system and no hidapi binding installed.")
+        print("Install one of these and run the script again:")
+        print("    pip install --user hid")
+        print("    sudo apt install python3-hid       # Debian, Ubuntu")
+        print("    sudo dnf install python3-hidapi    # Fedora")
         return 2
 
-    entries = scan(hid, args.vid, args.pid)
+    entries = scan(hid, args.vid, args.pid, args.backend)
     if not entries:
         print()
         print("No device with PID 0x%04X found. Plug the pad in and try again." % args.pid)

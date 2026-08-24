@@ -13,6 +13,7 @@ real hardware. They are the reason to believe the rest.
 """
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -222,6 +223,161 @@ if summary["usage_page"] == "0xFF00" and summary["usage"] == "0x01" and \
 else:
     failures.append("descriptor summary returned %r" % summary)
     print("FAIL  descriptor summary %r" % summary)
+
+# ── Enumeration without any hidapi binding ───────────────────────────────────
+# A tester on Ubuntu ran the probe and got "module 'hid' has no attribute
+# 'Device'": there are two unrelated packages called `hid` and his distro ships
+# the other one (#85). The probe now reads sysfs and /dev/hidraw itself, so
+# build a fake sysfs tree shaped like a real USB pad and check what it finds.
+import shutil                                                     # noqa: E402
+import tempfile                                                   # noqa: E402
+
+fake = tempfile.mkdtemp(prefix="macropad-sysfs-")
+try:
+    usb = os.path.join(fake, "devices", "usb1", "1-1")
+    interface = os.path.join(usb, "1-1:1.1")
+    hid_device = os.path.join(interface, "0003:3282:0008.0004")
+    os.makedirs(hid_device)
+    write = lambda where, what: open(where, "w").write(what)
+    write(os.path.join(usb, "manufacturer"), "Mountain\n")
+    write(os.path.join(usb, "product"), "MOUNTAIN MacroPad\n")
+    write(os.path.join(interface, "bInterfaceNumber"), "01\n")
+    write(os.path.join(hid_device, "uevent"),
+          "DRIVER=hid-generic\nHID_ID=0003:00003282:00000008\n"
+          "HID_NAME=Mountain MOUNTAIN MacroPad\n")
+    open(os.path.join(hid_device, "report_descriptor"), "wb").write(descriptor)
+    os.makedirs(os.path.join(fake, "class", "hidraw"))
+    os.symlink(hid_device, os.path.join(fake, "class", "hidraw", "hidraw7"))
+    # /sys/class/hidraw/hidraw7 is itself a link to the HID device, and the
+    # probe looks inside it for "device"; mirror that with a directory holding
+    # the link, which is what the kernel actually presents.
+    shutil.rmtree(os.path.join(fake, "class", "hidraw"))
+    node_dir = os.path.join(fake, "class", "hidraw", "hidraw7")
+    os.makedirs(node_dir)
+    os.symlink(hid_device, os.path.join(node_dir, "device"))
+
+    found = probe.hidraw_entries(0x3282, base=os.path.join(fake, "class", "hidraw"))
+    expected = {
+        "product_id": 0x0008,
+        "interface_number": 1,
+        "path": "/dev/hidraw7",
+        "usage_page": 0xFF00,
+        "usage": 0x01,
+        "product_string": "MOUNTAIN MacroPad",
+        "manufacturer_string": "Mountain",
+    }
+    if len(found) == 1 and all(found[0].get(k) == v for k, v in expected.items()):
+        print("ok    sysfs enumeration          interface %d, usage page 0x%04X"
+              % (found[0]["interface_number"], found[0]["usage_page"]))
+    else:
+        failures.append("sysfs enumeration returned %r" % (found,))
+        print("FAIL  sysfs enumeration %r" % (found,))
+
+    if probe.hidraw_entries(0x1234, base=os.path.join(fake, "class", "hidraw")) == []:
+        print("ok    sysfs enumeration filters other vendors")
+    else:
+        failures.append("sysfs enumeration ignored the vendor filter")
+        print("FAIL  sysfs enumeration vendor filter")
+finally:
+    shutil.rmtree(fake, ignore_errors=True)
+
+# ── The kernel node link, on a pipe ──────────────────────────────────────────
+# Proves the mechanics without hardware: the report number goes in front of the
+# payload, a read that finds nothing returns None instead of blocking forever.
+fifo_dir = tempfile.mkdtemp(prefix="macropad-fifo-")
+try:
+    fifo = os.path.join(fifo_dir, "hidraw99")
+    os.mkfifo(fifo)
+    link = probe.HidrawLink({"path": fifo})
+    link.write(probe.INIT_PACKET)
+    echoed = os.read(link.fd, 65)
+    if echoed == b"\x00" + probe.INIT_PACKET:
+        print("ok    hidraw write                report id 0 + 64 bytes")
+    else:
+        failures.append("hidraw write sent %r" % echoed[:8])
+        print("FAIL  hidraw write %r" % echoed[:8])
+
+    started = time.monotonic()
+    if link.read(120) is None and time.monotonic() - started < 1.0:
+        print("ok    hidraw read timeout")
+    else:
+        failures.append("hidraw read did not time out cleanly")
+        print("FAIL  hidraw read timeout")
+
+    os.write(link.fd, bytes([0x01, 0x08] + [0] * 62))
+    answer = link.read(500)
+    if answer and answer[:2] == b"\x01\x08":
+        print("ok    hidraw read                 %s" % answer[:4].hex(" "))
+    else:
+        failures.append("hidraw read returned %r" % (answer,))
+        print("FAIL  hidraw read %r" % (answer,))
+    link.close()
+finally:
+    shutil.rmtree(fifo_dir, ignore_errors=True)
+
+# ── Both hidapi flavours ─────────────────────────────────────────────────────
+# One package calls it hid.Device, the other hid.device(). The probe has to
+# open either, so hand it a stand-in for each and see that it does.
+class FakeDeviceClass:
+    """Looks like the `hid` package: a Device class taking path=."""
+    class Device:
+        def __init__(self, path=None):
+            self.path, self.written = path, []
+        def write(self, data):
+            self.written.append(data)
+        def read(self, size, timeout=None):
+            return bytes([0xAA] * 4)
+        def close(self):
+            pass
+
+
+class FakeDeviceFunction:
+    """Looks like the `hidapi` package: device() plus open_path()."""
+    class device:
+        def __init__(self):
+            self.path, self.written = None, []
+        def open_path(self, path):
+            self.path = path
+        def set_nonblocking(self, value):
+            self.nonblocking = value
+        def write(self, data):
+            self.written.append(data)
+        def read(self, size, timeout_ms=0):
+            return bytes([0xBB] * 4)
+        def close(self):
+            pass
+
+
+for label, module in (("hid.Device", FakeDeviceClass), ("hid.device", FakeDeviceFunction)):
+    try:
+        opened = probe.LibraryLink(module, {"path": "/dev/hidraw3", "source": "library"})
+        opened.write(probe.INIT_PACKET)
+        sent = opened.dev.written[0]
+        ok = (opened.kind == label and opened.dev.path == b"/dev/hidraw3" and
+              sent == b"\x00" + probe.INIT_PACKET and len(opened.read(10)) == 4)
+    except Exception as exc:
+        ok = False
+        print("      %s" % exc)
+    if ok:
+        print("ok    library link                %s" % label)
+    else:
+        failures.append("LibraryLink cannot drive the %s flavour" % label)
+        print("FAIL  library link %s" % label)
+
+no_flavour = type("Empty", (), {})
+try:
+    probe.LibraryLink(no_flavour, {"path": "/dev/hidraw3", "source": "library"})
+    failures.append("LibraryLink accepted a module with no usable API")
+    print("FAIL  library link rejects unusable module")
+except RuntimeError:
+    print("ok    library link rejects unusable module")
+
+flavour = probe.describe_hid_module(FakeDeviceFunction)
+if flavour["flavour"] == "hid.device" and flavour["present"]:
+    print("ok    hid module diagnosis        %s" % flavour["flavour"])
+else:
+    failures.append("describe_hid_module returned %r" % flavour)
+    print("FAIL  hid module diagnosis %r" % flavour)
 
 print()
 if failures:
