@@ -14,6 +14,8 @@ until the next poll. `pactl subscribe` makes the update immediate instead of
 merely frequent. If it is unavailable the code falls back to a rate-limited
 poll, which still works — it just flickers on wheel turns.
 """
+import ctypes
+import signal
 import subprocess
 import threading
 import time
@@ -63,11 +65,25 @@ def _read():
     return parse_wpctl_volume(out.strip())
 
 
+def _die_with_parent():
+    """Ask the kernel to signal this child when its parent dies.
+
+    The watcher thread is a daemon, so it is killed outright when the monitor
+    process ends and its `finally` never runs. Without this every start and
+    stop of Monitor Mode would strand a `pactl subscribe` process.
+    """
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)
+    except Exception:
+        pass                              # not fatal, only untidy
+
+
 def _watch_loop():
     global _level
     try:
         proc = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True)
+                                stderr=subprocess.DEVNULL, text=True,
+                                preexec_fn=_die_with_parent)
     except Exception:
         return
     try:
