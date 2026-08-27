@@ -783,7 +783,13 @@ def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
     packet[7] = int(direction) & 0xFF
     packet[8] = 2                         # byWidth
     packet[9] = 1                         # byBlockNum
-    packet[10], packet[11], packet[12] = (c & 0xFF for c in color)
+    # FWBColor is four bytes, a leading `pos` and then r, g, b. The first run
+    # of this put the colour one byte early, which is why the pad lit white
+    # instead of red. The SDK writes 100 into the first pos and 0xFF into the
+    # second, so this does too.
+    packet[10] = 100
+    packet[11], packet[12], packet[13] = (c & 0xFF for c in color)
+    packet[14] = 0xFF
     return bytes(packet)
 
 

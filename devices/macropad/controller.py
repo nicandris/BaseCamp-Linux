@@ -279,7 +279,23 @@ def pkt_effect(effect, brightness=DEFAULT_BRIGHTNESS, speed=DEFAULT_SPEED,
 #
 #   [2] byEffectIndex   [3] byAll       [4] bySpeed    [5] byLightness
 #   [6] byRandColor     [7] byDirection [8] byWidth    [9] byBlockNum
-#   [10:16] colorLv[2]
+#   [10:18] colorLv[2]  [18:38] undef[5]  [38:41] bkColor  [41:64] undef[23]
+#
+# And the colours are not the same type either. EffData carries FWColor, three
+# bytes of r, g, b. BlockData carries FWBColor, **four**: a leading `pos`, then
+# r, g, b. @Thargorrr's second run in #85 is what forced this out: the block
+# form lit the pad where the old form left it dark, but it lit white rather
+# than the red it was sent, because the red had been written one byte early
+# and the pad read pos=255, r=0, g=0. The two structs add up to 62 bytes only
+# with the right colour type, which is the arithmetic that confirms it:
+#
+#   EffData    7 + 3x3 + 3 + 43                = 62
+#   BlockData  8 + 2x4 + 5x4 + 3 + 23          = 62
+#
+# The SDK does not leave `pos` at zero either. Its wrapper writes 100 into the
+# first colour and 0xFF into the second before the packet goes out.
+BLOCK_POS_FIRST  = 100
+BLOCK_POS_SECOND = 0xFF
 #
 # Direction is not the plain 0 to 3 the UI shows either. Base Camp maps it:
 BLOCK_EFFECTS = (EFFECT_WAVE, EFFECT_TORNADO)
@@ -326,9 +342,12 @@ def pkt_block_effect(effect, brightness=DEFAULT_BRIGHTNESS, speed=DEFAULT_SPEED,
     p[9] = 0 if color_mode == COLOR_RANDOM else 1
 
     if color_mode != COLOR_RANDOM:
-        p[10], p[11], p[12] = _rgb(color1)
+        # FWBColor: pos first, then r, g, b. Four bytes, not three.
+        p[10] = BLOCK_POS_FIRST
+        p[11], p[12], p[13] = _rgb(color1)
+        p[14] = BLOCK_POS_SECOND
         if color2 is not None:
-            p[13], p[14], p[15] = _rgb(color2)
+            p[15], p[16], p[17] = _rgb(color2)
     return bytes(p)
 
 

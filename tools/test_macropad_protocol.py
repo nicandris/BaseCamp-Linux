@@ -264,8 +264,14 @@ verify("wave: speed and brightness", (wave[4], wave[5]) == (60, 60))
 verify("wave: direction 0 goes out as 6", wave[7] == 6, wave[7])
 verify("wave: width is 2, not unused", wave[8] == mp.BLOCK_WIDTH, wave[8])
 verify("wave: one block", wave[9] == 1, wave[9])
-verify("wave: the colour sits at 10, not 9",
-       wave[10:13] == b"\xff\x00\x00" and wave[9] != 0xFF, wave[9:13].hex(" "))
+# FWBColor is four bytes: pos, then r, g, b. @Thargorrr's second run showed
+# the block form lighting the pad white instead of the red it was sent, which
+# is what a colour written one byte early looks like from the front.
+verify("wave: the first colour is pos then rgb",
+       wave[10] == mp.BLOCK_POS_FIRST and wave[11:14] == b"\xff\x00\x00",
+       wave[10:14].hex(" "))
+verify("wave: the second colour carries a pos too",
+       wave[14] == mp.BLOCK_POS_SECOND, wave[14])
 
 for ui, wire in enumerate(mp.WAVE_DIRECTIONS):
     got = mp.pkt_block_effect(mp.EFFECT_WAVE, direction=ui)[7]
@@ -279,9 +285,15 @@ for ui, wire in enumerate(mp.TORNADO_DIRECTIONS):
 print("ok    tornado directions                 %s" % (list(mp.TORNADO_DIRECTIONS),))
 
 dual = mp.pkt_block_effect(mp.EFFECT_WAVE, color1=(1, 2, 3), color2=(4, 5, 6))
-verify("wave: two colours, back to back",
-      dual[10:16] == bytes([1, 2, 3, 4, 5, 6]) and dual[6] == mp.COLOR_DUAL,
-      dual[6:16].hex(" "))
+verify("wave: two colours, four bytes each",
+       dual[10:18] == bytes([mp.BLOCK_POS_FIRST, 1, 2, 3,
+                             mp.BLOCK_POS_SECOND, 4, 5, 6])
+       and dual[6] == mp.COLOR_DUAL, dual[10:18].hex(" "))
+
+# Each struct is 62 bytes only with its own colour type, which is the
+# arithmetic that says which one belongs where.
+verify("EffData adds up with a 3 byte colour", 7 + 3 * 3 + 3 + 43 == 62)
+verify("BlockData adds up with a 4 byte colour", 8 + 2 * 4 + 5 * 4 + 3 + 23 == 62)
 rand = mp.pkt_block_effect(mp.EFFECT_WAVE, color_mode=mp.COLOR_RANDOM)
 verify("wave: a random colour carries no block", rand[9] == 0, rand[9])
 
