@@ -262,7 +262,11 @@ verify("wave: 14 2c and the effect index", wave[:3] == bytes([0x14, 0x2C, 0x04])
       wave[:3].hex(" "))
 verify("wave: speed and brightness", (wave[4], wave[5]) == (60, 60))
 verify("wave: direction 0 goes out as 6", wave[7] == 6, wave[7])
-verify("wave: width is 2, not unused", wave[8] == mp.BLOCK_WIDTH, wave[8])
+# byWidth 0, not 2: the builder in the service says 2 and the SDK's wrapper
+# overwrites it. @Thargorrr's third run is what forced this out, wave lit in
+# the right colour and stood still.
+verify("wave: width is 0 so the block travels",
+       wave[8] == mp.BLOCK_WIDTH_MOVING, wave[8])
 verify("wave: one block", wave[9] == 1, wave[9])
 # FWBColor is four bytes: pos, then r, g, b. @Thargorrr's second run showed
 # the block form lighting the pad white instead of the red it was sent, which
@@ -284,18 +288,30 @@ for ui, wire in enumerate(mp.TORNADO_DIRECTIONS):
         failures.append("tornado direction %d went out as %d, expected %d" % (ui, got, wire))
 print("ok    tornado directions                 %s" % (list(mp.TORNADO_DIRECTIONS),))
 
+# A two colour wave is a different shape: the wrapper repeats the pair and
+# spaces all four along the strip.
 dual = mp.pkt_block_effect(mp.EFFECT_WAVE, color1=(1, 2, 3), color2=(4, 5, 6))
-verify("wave: two colours, four bytes each",
-       dual[10:18] == bytes([mp.BLOCK_POS_FIRST, 1, 2, 3,
-                             mp.BLOCK_POS_SECOND, 4, 5, 6])
-       and dual[6] == mp.COLOR_DUAL, dual[10:18].hex(" "))
+verify("wave, two colours: four stops",
+       dual[9] == 4 and dual[8] == mp.BLOCK_WIDTH_SPREAD, (dual[8], dual[9]))
+verify("wave, two colours: spaced 25, 50, 75, 100",
+       tuple(dual[10 + i * 4] for i in range(4)) == mp.WAVE_GRADIENT_POS,
+       [dual[10 + i * 4] for i in range(4)])
+verify("wave, two colours: the pair repeats",
+       dual[11:14] == b"\x01\x02\x03" and dual[15:18] == b"\x04\x05\x06"
+       and dual[19:22] == b"\x01\x02\x03" and dual[23:26] == b"\x04\x05\x06",
+       dual[10:26].hex(" "))
+verify("tornado keeps one block and width 0",
+       mp.pkt_block_effect(mp.EFFECT_TORNADO, color1=(1, 2, 3))[8:10]
+       == bytes([mp.BLOCK_WIDTH_MOVING, 1]))
 
 # Each struct is 62 bytes only with its own colour type, which is the
 # arithmetic that says which one belongs where.
 verify("EffData adds up with a 3 byte colour", 7 + 3 * 3 + 3 + 43 == 62)
 verify("BlockData adds up with a 4 byte colour", 8 + 2 * 4 + 5 * 4 + 3 + 23 == 62)
 rand = mp.pkt_block_effect(mp.EFFECT_WAVE, color_mode=mp.COLOR_RANDOM)
-verify("wave: a random colour carries no block", rand[9] == 0, rand[9])
+verify("wave: a random colour carries no block",
+       rand[9] == 0 and rand[6] == mp.COLOR_RANDOM
+       and rand[8] == mp.BLOCK_WIDTH_SPREAD, rand[6:11].hex(" "))
 
 try:
     mp.pkt_block_effect(mp.EFFECT_STATIC)
@@ -408,6 +424,7 @@ pairs = [
     ("probe wave, block form", probe.block_effect_packet(4, direction=6),
      mp.pkt_block_effect(mp.EFFECT_WAVE, brightness=60, speed=60,
                          color1=(255, 0, 0), direction=0)),
+    # the probe sends tornado with the wire direction 10, which is UI 0
     ("probe tornado, block form", probe.block_effect_packet(7, direction=10),
      mp.pkt_block_effect(mp.EFFECT_TORNADO, brightness=60, speed=60,
                          color1=(255, 0, 0), direction=0)),

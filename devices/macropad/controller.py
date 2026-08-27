@@ -303,7 +303,20 @@ BLOCK_EFFECTS = (EFFECT_WAVE, EFFECT_TORNADO)
 
 WAVE_DIRECTIONS    = (6, 2, 4, 0)     # UI 0..3, from getChangeBlockEffect()
 TORNADO_DIRECTIONS = (10, 9)          # UI 0..1
-BLOCK_WIDTH = 2
+
+# getChangeBlockEffect() builds the struct, and then the SDK's own wrapper
+# rewrites parts of it before the packet goes out. Reading only the first of
+# those is what left Wave lit but standing still in @Thargorrr's third run:
+# the builder sets byWidth to 2, and the wrapper overwrites it with 0 for both
+# of these effects. Tornado rotated anyway, so it tolerates the 2; Wave does
+# not, and a single block two wide is a block that does not travel.
+#
+# A dual colour Wave is a different shape again: the wrapper copies the two
+# colours into the next two slots and spaces all four along the strip at
+# 25, 50, 75 and 100, with byBlockNum set to 4.
+BLOCK_WIDTH_MOVING = 0                # single colour, and Tornado always
+BLOCK_WIDTH_SPREAD = 2                # a dual colour Wave, and random
+WAVE_GRADIENT_POS  = (25, 50, 75, 100)
 
 
 def uses_block_effect(effect):
@@ -337,18 +350,36 @@ def pkt_block_effect(effect, brightness=DEFAULT_BRIGHTNESS, speed=DEFAULT_SPEED,
 
     table = WAVE_DIRECTIONS if effect == EFFECT_WAVE else TORNADO_DIRECTIONS
     p[7] = table[int(direction) % len(table)]
-    p[8] = BLOCK_WIDTH
-    # A random colour carries no block, which is what the SDK sets alongside
-    # byRandColor = 2.
-    p[9] = 0 if color_mode == COLOR_RANDOM else 1
 
-    if color_mode != COLOR_RANDOM:
-        # FWBColor: pos first, then r, g, b. Four bytes, not three.
-        p[10] = BLOCK_POS_FIRST
-        p[11], p[12], p[13] = _rgb(color1)
-        p[14] = BLOCK_POS_SECOND
-        if color2 is not None:
-            p[15], p[16], p[17] = _rgb(color2)
+    # From here on this follows the SDK wrapper rather than the builder, since
+    # the wrapper is what decides the bytes that leave the machine.
+    if color_mode == COLOR_RANDOM:
+        p[6] = COLOR_RANDOM
+        p[8] = BLOCK_WIDTH_SPREAD
+        p[9] = 0                       # no block: the firmware picks
+        p[10] = BLOCK_POS_SECOND
+        return bytes(p)
+
+    p[6] = COLOR_SINGLE                # the wrapper clears this for both
+
+    if effect == EFFECT_WAVE and color2 is not None:
+        # Four stops: the two colours, then the same two again.
+        p[8] = BLOCK_WIDTH_SPREAD
+        p[9] = 4
+        first, second = _rgb(color1), _rgb(color2)
+        for slot, (pos, rgb) in enumerate(zip(WAVE_GRADIENT_POS,
+                                              (first, second, first, second))):
+            at = 10 + slot * 4
+            p[at] = pos
+            p[at + 1], p[at + 2], p[at + 3] = rgb
+        return bytes(p)
+
+    # One colour, one block, and a width of zero so it travels.
+    p[8] = BLOCK_WIDTH_MOVING
+    p[9] = 1
+    p[10] = BLOCK_POS_FIRST
+    p[11], p[12], p[13] = _rgb(color1)
+    p[14] = BLOCK_POS_SECOND
     return bytes(p)
 
 

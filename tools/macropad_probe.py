@@ -784,7 +784,10 @@ def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
     packet[5] = max(0, min(100, brightness))
     packet[6] = 0                         # byRandColor: single colour
     packet[7] = int(direction) & 0xFF
-    packet[8] = 2                         # byWidth
+    # byWidth 0, not 2. getChangeBlockEffect builds it as 2 and the SDK's own
+    # wrapper overwrites it with 0 for both of these effects. With 2 the wave
+    # lit in the right colour and stood still.
+    packet[8] = 0                         # byWidth
     packet[9] = 1                         # byBlockNum
     # FWBColor is four bytes, a leading `pos` and then r, g, b. The first run
     # of this put the colour one byte early, which is why the pad lit white
