@@ -1251,6 +1251,11 @@ class DisplayPadActionsDialog(ctk.CTkToplevel):
         self._page_targets = [None] * 12  # idx -> resolved target page id or "new"
         self._plugin_combos = []  # plugin types with value_options
         self._plugin_combo_maps = {}  # idx -> {display_label: value}
+        # True while this dialog is writing a key. The panel keeps the two
+        # editors in step by making each one re-read after the other saves
+        # (#84), but this dialog re-reading itself mid-save means every row
+        # that has been typed into and not yet written is reverted (#87).
+        self._saving = False
         self._hue_values_map = []
         self._hue_bri_target = {}  # idx -> "group:1" or "light:3"
         # Secondary "also on press" action (issue #16)
@@ -2080,14 +2085,17 @@ class DisplayPadActionsDialog(ctk.CTkToplevel):
         self._dbl_cmd[idx].set(val)
         self._apply(idx)
 
-    def _on_obs_select(self, val, idx):
-        """Called when user picks a scene or record/stream from OBS combo."""
+    def _take_obs_value(self, val, idx):
         if val == "OBS: Record":
             self._act_cmd[idx].set("record")
         elif val == "OBS: Stream":
             self._act_cmd[idx].set("stream")
         else:
             self._act_cmd[idx].set(f"scene:{val}")
+
+    def _on_obs_select(self, val, idx):
+        """Called when user picks a scene or record/stream from OBS combo."""
+        self._take_obs_value(val, idx)
         self._apply(idx)
 
     def _macro_names(self):
@@ -2114,7 +2122,7 @@ class DisplayPadActionsDialog(ctk.CTkToplevel):
             # Say so, rather than leaving the widget's own placeholder on screen.
             combo.set(no_macros)
 
-    def _on_macro_select(self, val, idx):
+    def _take_macro_value(self, val, idx):
         names = self._macro_names()
         display = list(names.values())
         uuids = list(names.keys())
@@ -2123,12 +2131,18 @@ class DisplayPadActionsDialog(ctk.CTkToplevel):
             self._act_cmd[idx].set(uuids[pos])
         except (ValueError, IndexError):
             pass
+
+    def _on_macro_select(self, val, idx):
+        self._take_macro_value(val, idx)
         self._apply(idx)
 
-    def _on_plugin_value_select(self, val, idx):
+    def _take_plugin_value(self, val, idx):
         # Map display label back to internal value (free text falls through verbatim)
         mapped = self._plugin_combo_maps.get(idx, {}).get(val, val)
         self._act_cmd[idx].set(mapped)
+
+    def _on_plugin_value_select(self, val, idx):
+        self._take_plugin_value(val, idx)
         self._apply(idx)
 
     def _populate_hue_combo(self, combo, hue_type, current_val="", btn_idx=None):
@@ -2187,7 +2201,7 @@ class DisplayPadActionsDialog(ctk.CTkToplevel):
             if btn_idx is not None:
                 self._act_cmd[btn_idx].set(values_map[0])
 
-    def _on_hue_select(self, val, idx):
+    def _take_hue_value(self, val, idx):
         items = self._hue_combos[idx].cget("values")
         try:
             pos = list(items).index(val) if isinstance(items, (list, tuple)) else 0
@@ -2201,6 +2215,9 @@ class DisplayPadActionsDialog(ctk.CTkToplevel):
                     self._act_cmd[idx].set(target)
         except (ValueError, IndexError):
             pass
+
+    def _on_hue_select(self, val, idx):
+        self._take_hue_value(val, idx)
         self._apply(idx)
 
     def _assemble_hue_bri(self, idx):
@@ -2275,7 +2292,39 @@ class DisplayPadActionsDialog(ctk.CTkToplevel):
         _rebuild()
         search_var.trace_add("write", lambda *_: _rebuild(search_var.get()))
 
+    def _flush_value_widget(self, idx):
+        """Copy what the visible value widget holds into this row's variable.
+
+        The plain entries are bound to their variable and need nothing. The
+        four combo boxes are not: they only hand over what was typed into them
+        when the person picks from the list or the widget loses focus. Clicking
+        Apply moves no focus, so a typed value was simply thrown away (#87),
+        and forcing a focus change first does not help either, because a focus
+        event is not an idle task and is still in the queue when Apply reads
+        the variable. So Apply asks the widget instead of hoping.
+        """
+        btype = self._act_type[idx].get()
+        try:
+            if btype == "obs" and idx < len(self._obs_combos) \
+                    and self._obs_combos[idx].winfo_ismapped():
+                self._take_obs_value(self._obs_combos[idx].get(), idx)
+            elif btype == "macro" and idx < len(self._macro_combos) \
+                    and self._macro_combos[idx].winfo_ismapped():
+                self._take_macro_value(self._macro_combos[idx].get(), idx)
+            elif btype in ("hue_toggle", "hue_scene", "hue_bri") \
+                    and idx < len(self._hue_combos) \
+                    and self._hue_combos[idx].winfo_ismapped():
+                self._take_hue_value(self._hue_combos[idx].get(), idx)
+            elif idx < len(self._plugin_combos) \
+                    and self._plugin_combos[idx].winfo_ismapped():
+                self._take_plugin_value(self._plugin_combos[idx].get(), idx)
+        except Exception:
+            # A widget that is being rebuilt underneath us is not worth
+            # losing the rest of the save over.
+            pass
+
     def _apply(self, idx):
+        self._flush_value_widget(idx)
         btype  = self._act_type[idx].get()
         action = self._act_cmd[idx].get().strip()
         # For hue_bri, assemble "target:pct" from combo + entry
@@ -2318,8 +2367,12 @@ class DisplayPadActionsDialog(ctk.CTkToplevel):
                 double = step
         # Primary 'page' action carries the target picked in the combo (#30).
         target = self._page_targets[idx] if btype == "page" else None
-        self._panel._save_page_action(self._page, idx, btype, action, extra,
-                                      target=target, double=double)
+        self._saving = True
+        try:
+            self._panel._save_page_action(self._page, idx, btype, action, extra,
+                                          target=target, double=double)
+        finally:
+            self._saving = False
         self._panel._gc_orphan_pages()
         self._info_lbl.configure(
             text=self._app.T("dp_act_saved", k=idx + 1), text_color=GRN)
@@ -2331,9 +2384,14 @@ class DisplayPadActionsDialog(ctk.CTkToplevel):
         self._page_selector.set(self._panel._get_page_name(self._page))
 
     def _apply_all_and_close(self):
-        """Save all 12 button actions (catches unsaved entries) and close."""
-        # Force any active entry to commit by moving focus away first —
-        # otherwise typed text that hasn't triggered FocusOut yet would be lost.
+        """Save all 12 button actions (catches unsaved entries) and close.
+
+        Two things had to be true for this to keep what was typed (#87), and
+        both are handled in _apply() itself: it reads the visible widget rather
+        than waiting for a focus event that clicking a button never sends, and
+        it holds off this dialog's own re-read while it writes, which is what
+        used to revert every row the loop had not reached yet.
+        """
         try:
             self.focus_set()
             self.update_idletasks()
@@ -2383,7 +2441,10 @@ class DisplayPadPanel(ctk.CTkFrame):
         self._min_frame_ms     = 50
         self._dialog_win       = None
         self._upload_queue     = queue.Queue()
-        self._plugin_frame_keys = {}     # page -> {key idx} currently showing a
+        self._plugin_frame_keys = {}
+        # Per key, the image path the grid was last redrawn for, so a widget
+        # pushing frames only costs a redraw when the picture really changed.
+        self._tile_shown = {}     # page -> {key idx} currently showing a
                                           # plugin's live frame instead of the
                                           # key's icon (see _persistable_images)
         self._fullscreen_group = set()   # key indices that form a synced fullscreen GIF
@@ -3502,7 +3563,12 @@ class DisplayPadPanel(ctk.CTkFrame):
         try:
             dlg = getattr(self, "_actions_dialog_win", None)
             try:
-                if dlg is not None and dlg.winfo_exists():
+                # Not while that dialog is the one saving: it does not need
+                # telling what it just wrote, and re-reading itself would
+                # revert every other row that has been typed into and not
+                # written yet (#87).
+                if dlg is not None and dlg.winfo_exists() \
+                        and not getattr(dlg, "_saving", False):
                     dlg._load_page(dlg._page)
             except Exception:
                 pass
@@ -4260,6 +4326,29 @@ class DisplayPadPanel(ctk.CTkFrame):
         elif not self._uploading:
             self.after(100, self._start_upload)
 
+    def _note_plugin_tile(self, idx):
+        """Redraw a key's tile when a widget's frame changes what it shows.
+
+        The grid draws whatever `_images` holds. A plugin writes its frame in
+        there itself, but nothing ever told the grid, so the tile kept showing
+        the icon stored for that key while the pad showed the widget. After a
+        restart that is the stored icon, which for a key that was cleared
+        before the widget was assigned is the blank one, and it stayed blank
+        in the editor for as long as nothing else happened to redraw it (#90).
+
+        Only on a change of path, so a video pushing frames does not redraw the
+        same file thirty times a second.
+        """
+        path = self._images.get(str(idx))
+        if not path or self._tile_shown.get(idx) == path:
+            return
+        self._tile_shown[idx] = path
+        try:
+            self.after(0, lambda i=idx: self._refresh_panel_tile(i))
+        except Exception:
+            # The window is going away; a tile nobody will see is no loss.
+            pass
+
     def _refresh_panel_tile(self, idx):
         rot = self._rotation
         is_gif = idx in self._gif_frames
@@ -4827,6 +4916,7 @@ class DisplayPadPanel(ctk.CTkFrame):
         # tile and a full page upload show it. Note the key, so the frame stays
         # out of the config and does not become that key's icon (#69).
         self._mark_plugin_frame(key_index)
+        self._note_plugin_tile(key_index)
         _dbg(f"[DBG push_plugin_image] key={key_index} current_page={self._current_page}")
         img = pil_image.convert("RGB").resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
         rot = self._rotation

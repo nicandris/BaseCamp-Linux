@@ -227,9 +227,46 @@ def _device_access_denied(vid, pid):
     on its /dev entries are, so presence alone said "connected" while every
     action quietly did nothing. That is what a missing or unapplied udev rule
     looks like from the outside (issue #49). Empty list means all good.
+
+    A node that is gone by the time it is checked is not a permission problem
+    and must not be reported as one. The DisplayPad re-enumerates by itself,
+    so the node listed a moment ago can be the one it has just dropped, and
+    os.access() answers False for a path that does not exist. That put a full
+    "no permission" notice over a device whose /dev entry was plain 0666 the
+    whole time (issue #86).
     """
-    return [n for n in _device_nodes(vid, pid)
-            if not os.access(n, os.R_OK | os.W_OK)]
+    denied = []
+    for node in _device_nodes(vid, pid):
+        try:
+            if os.access(node, os.R_OK | os.W_OK):
+                continue
+            if not os.path.exists(node):
+                continue
+        except OSError:
+            continue
+        denied.append(node)
+    return denied
+
+
+def _describe_node(path):
+    """Owner, group and mode of a device node, for the log line that says we
+    cannot open it. Without this a false report is indistinguishable from a
+    real one, and #86 was reported with an `ls` that contradicted us."""
+    try:
+        import grp
+        import pwd
+        st = os.stat(path)
+        try:
+            owner = pwd.getpwuid(st.st_uid).pw_name
+        except KeyError:
+            owner = str(st.st_uid)
+        try:
+            group = grp.getgrgid(st.st_gid).gr_name
+        except KeyError:
+            group = str(st.st_gid)
+        return "%s (%s:%s %o)" % (path, owner, group, st.st_mode & 0o7777)
+    except OSError as exc:
+        return "%s (%s)" % (path, exc.__class__.__name__)
 
 
 def _check_usb_presence(vid, pid):
@@ -1652,10 +1689,11 @@ class App(ctk.CTk):
                 self._dev_denied[dev_id] = denied
                 if dev_id not in self._denied_logged:
                     self._denied_logged.add(dev_id)
-                    print(f"[Device] {dev_id}: no access to "
-                          f"{', '.join(sorted(denied))}. The udev rule is "
-                          f"missing or has not been applied; see 'USB "
-                          f"permissions' in the README.", flush=True)
+                    described = ", ".join(_describe_node(n)
+                                          for n in sorted(denied))
+                    print(f"[Device] {dev_id}: no access to {described}. "
+                          f"The udev rule is missing or has not been applied; "
+                          f"see 'USB permissions' in the README.", flush=True)
             else:
                 # Access is back: drop the notice at once, no counting down.
                 self._denied_strikes.pop(dev_id, None)
