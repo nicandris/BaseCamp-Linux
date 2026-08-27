@@ -136,17 +136,170 @@ if mp.is_ack(bytes([0x14, 0x2C] + [0] * 62)):
     failures.append("is_ack accepted a non-ack")
 print("ok    ack detection")
 
-# decode_key_event is the unverified part; check it is at least self-consistent.
-event = bytearray(64)
-event[0] = 0x01
-event[1] = 0b00000101   # keys 0 and 2
-event[2] = 0b00001000   # key 11
-decoded = mp.decode_key_event(bytes(event))
-if decoded != {0, 2, 11}:
-    failures.append("decode_key_event returned %r, expected {0, 2, 11}" % decoded)
-    print("FAIL  decode_key_event %r" % decoded)
+# ── Key events, measured on real hardware ────────────────────────────────────
+# Issue #85: two owners ran tools/macropad_probe.py on their own MacroPads,
+# on Ubuntu and on Arch, with different firmware builds (11 00 .. 06 04 01 01
+# and 06 0a 01 06). Their captures agree byte for byte. This is where that
+# measurement is written down, so a refactor cannot quietly undo it.
+#
+# One capture kept verbatim as it came off the wire, M1 pressed:
+M1_PRESSED = bytes.fromhex(
+    "01000000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000002000000000000000000000000000000000000000000"
+)
+# and the report that followed when the key came up again:
+M1_RELEASED = bytes.fromhex(
+    "01000000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000"
+)
+
+# The rest as the byte/bit pairs both dumps show, M1 through M12:
+CAPTURED_KEYS = (
+    [(42, mask) for mask in (0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80)] +
+    [(47, mask) for mask in (0x01, 0x02, 0x04, 0x08, 0x10)]
+)
+
+
+def key_report(pairs):
+    """Build the report the pad sends while `pairs` are held down."""
+    report = bytearray(64)
+    report[0] = 0x01
+    for byte, mask in pairs:
+        report[byte] |= mask
+    return bytes(report)
+
+
+if len(M1_PRESSED) != 64:
+    failures.append("the verbatim M1 capture is %d bytes, expected 64" % len(M1_PRESSED))
+    print("FAIL  verbatim capture length %d" % len(M1_PRESSED))
+elif mp.decode_key_event(M1_PRESSED) != {0}:
+    failures.append("verbatim M1 capture decoded as %r" % mp.decode_key_event(M1_PRESSED))
+    print("FAIL  verbatim M1 capture %r" % mp.decode_key_event(M1_PRESSED))
 else:
-    print("ok    decode_key_event (hypothesis, not verified on hardware)")
+    print("ok    verbatim M1 capture        key 0")
+
+if mp.decode_key_event(M1_RELEASED) != set():
+    failures.append("the release report decoded as a press: %r"
+                    % mp.decode_key_event(M1_RELEASED))
+    print("FAIL  release report %r" % mp.decode_key_event(M1_RELEASED))
+else:
+    print("ok    release report            nothing pressed")
+
+wrong = []
+for index, pair in enumerate(CAPTURED_KEYS):
+    decoded = mp.decode_key_event(key_report([pair]))
+    if decoded != {index}:
+        wrong.append("M%d (byte %d mask 0x%02x) decoded as %r"
+                     % (index + 1, pair[0], pair[1], decoded))
+if wrong:
+    failures.extend(wrong)
+    print("FAIL  captured key map")
+    for problem in wrong:
+        print("      %s" % problem)
+else:
+    print("ok    captured key map          M1-M12 on hardware")
+
+# Nobody captured two keys at once, so this is derived from the map rather
+# than measured. It is still worth pinning: the bits are independent.
+both = mp.decode_key_event(key_report([CAPTURED_KEYS[0], CAPTURED_KEYS[11]]))
+if both != {0, 11}:
+    failures.append("two keys at once decoded as %r, expected {0, 11}" % both)
+    print("FAIL  two keys at once %r" % both)
+else:
+    print("ok    two keys at once          {0, 11}")
+
+# Interface 2 also answers with 0x11 packets (init echo, firmware). Those must
+# never be mistaken for a key event, and a short read must not pass either.
+for label, other in (("init echo", mp.pkt_init(True)),
+                     ("firmware info", mp.pkt_firmware_info()),
+                     ("ack", bytes([0xFF, 0xAA] + [0] * 62)),
+                     ("truncated", bytes([0x01] + [0] * 20))):
+    if mp.decode_key_event(other) != set() or mp.is_key_event(other):
+        failures.append("%s was taken for a key event" % label)
+        print("FAIL  %s taken for a key event" % label)
+    else:
+        print("ok    %-28s not a key event" % label)
+
+# The DisplayPad reports the same way, and its map is the one the shipping
+# driver has been using against real hardware for months. Drifting apart would
+# mean one of the two is wrong.
+displaypad_map = [
+    (42, 0x02), (42, 0x04), (42, 0x08), (42, 0x10), (42, 0x20), (42, 0x40),
+    (42, 0x80), (47, 0x01), (47, 0x02), (47, 0x04), (47, 0x08), (47, 0x10),
+]
+if list(mp.KEY_MAP) != displaypad_map:
+    failures.append("KEY_MAP no longer matches the DisplayPad map")
+    print("FAIL  key map matches DisplayPad")
+else:
+    print("ok    key map                   matches the DisplayPad")
+
+# ── Stored settings must never take the application down ─────────────────────
+# The MacroPad screen is built at startup, not on first visit, so anything
+# that raises while reading its config file stops the window from appearing.
+# These files are plain json in the config directory and people do edit them.
+import json as _json          # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+from shared import config as _cfg   # noqa: E402
+
+
+def stored_rgb(payload):
+    """What _load_macropad_rgb makes of a file containing `payload`."""
+    handle, path = _tempfile.mkstemp(suffix=".json")
+    with os.fdopen(handle, "w") as f:
+        f.write(payload if isinstance(payload, str) else _json.dumps(payload))
+    real = _cfg.MACROPAD_RGB_FILE
+    _cfg.MACROPAD_RGB_FILE = path
+    try:
+        return _cfg._load_macropad_rgb()
+    finally:
+        _cfg.MACROPAD_RGB_FILE = real
+        os.unlink(path)
+
+
+def usable(rgb):
+    """Do to it exactly what the screen does when it builds itself."""
+    int(rgb["brightness"]), int(rgb["speed"]), int(rgb["effect"])
+    for color in rgb["colors"] + [rgb["color1"], rgb["color2"]]:
+        "#%02x%02x%02x" % (int(color[0]) & 0xFF, int(color[1]) & 0xFF,
+                           int(color[2]) & 0xFF)
+    return len(rgb["colors"]) == mp.NUM_KEYS
+
+
+for label, payload in (
+        ("colours as words", {"colors": [["a", "b", "c"]] * 12}),
+        ("brightness as a word", {"brightness": "bright"}),
+        ("effect as a word", {"effect": "static"}),
+        ("colour pairs, not triples", {"colors": [[1, 2]] * 12}),
+        ("colours out of range", {"colors": [[999, -5, 0]] * 12}),
+        ("a list where a dict belongs", [1, 2, 3]),
+        ("truncated json", '{"effect": 0, "brig'),
+        ("too few colours", {"colors": [[1, 2, 3]]}),
+        ("too many colours", {"colors": [[1, 2, 3]] * 40}),
+        ("colours not a list", {"colors": "red"}),
+        ("an empty file", ""),
+):
+    try:
+        if usable(stored_rgb(payload)):
+            print("ok    %-30s survives" % label)
+        else:
+            failures.append("lighting config: %s gave the wrong shape" % label)
+            print("FAIL  %-30s wrong shape" % label)
+    except Exception as exc:
+        failures.append("lighting config: %s raised %r" % (label, exc))
+        print("FAIL  %-30s raised %r" % (label, exc))
+
+# Values that are fine must come through untouched, or the coercion is just
+# throwing settings away.
+kept = stored_rgb({"effect": 4, "brightness": 30, "speed": 90,
+                   "color1": [10, 20, 30], "color2": [40, 50, 60],
+                   "colors": [[i, i, i] for i in range(12)]})
+if (kept["effect"], kept["brightness"], kept["speed"]) == (4, 30, 90) \
+        and kept["color1"] == [10, 20, 30] and kept["colors"][11] == [11, 11, 11]:
+    print("ok    %-30s kept as they are" % "good values")
+else:
+    failures.append("lighting config: good values were changed: %r" % kept)
+    print("FAIL  good values were changed")
+
 
 # ── The probe script must agree with the driver ──────────────────────────────
 # tools/macropad_probe.py is deliberately standalone so testers can download

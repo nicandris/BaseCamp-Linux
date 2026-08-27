@@ -140,6 +140,11 @@ DISPLAYPAD_BRIGHTNESS_FILE  = os.path.join(CONFIG_DIR, "displaypad_brightness")
 DISPLAYPAD_DEBOUNCE_FILE    = os.path.join(CONFIG_DIR, "displaypad_debounce")
 DISPLAYPAD_MIN_MS_FILE      = os.path.join(CONFIG_DIR, "displaypad_min_ms")
 DISPLAYPAD_ACTIONS_DIALOG_SIZE_FILE = os.path.join(CONFIG_DIR, "displaypad_actions_dialog_size.json")
+# MacroPad (PID 0x0008). Same chassis as the DisplayPad, but no screens, so
+# there is nothing per-key to store except the action and the colour.
+MACROPAD_ACTIONS_FILE       = os.path.join(CONFIG_DIR, "macropad_actions.json")
+MACROPAD_RGB_FILE           = os.path.join(CONFIG_DIR, "macropad_rgb.json")
+
 MACROS_FILE                 = os.path.join(CONFIG_DIR, "macros.json")
 MOUSE_RECORDINGS_DIR        = os.path.join(CONFIG_DIR, "mouse_recordings")
 LAST_DIRS_FILE              = os.path.join(CONFIG_DIR, "last_dirs.json")
@@ -789,6 +794,93 @@ def _load_presets_60():
 def _save_presets_60(presets):
     with open(PRESET_60_FILE, "w") as f:
         f.write(json.dumps(presets, indent=2))
+
+
+# ── MacroPad storage ────────────────────────────────────────────────────────────
+
+_MACROPAD_KEYS = 12
+
+
+def _load_macropad_actions():
+    """The 12 key actions, as [{"type": ..., "action": ...}] for M1 to M12.
+
+    A missing or half written file is not worth an error on a screen the
+    person may only be opening to change the lighting, so it degrades to
+    "nothing bound" the way the DisplayPad does. Type and value are forced to
+    strings for the same reason the colours are coerced above: this screen is
+    built before the window appears.
+    """
+    actions = [{"type": "none", "action": ""} for _ in range(_MACROPAD_KEYS)]
+    try:
+        data = _read_json(MACROPAD_ACTIONS_FILE).get("actions", [])
+        for i in range(_MACROPAD_KEYS):
+            if i < len(data) and isinstance(data[i], dict):
+                actions[i]["type"] = str(data[i].get("type", "none") or "none")
+                actions[i]["action"] = str(data[i].get("action", "") or "")
+    except Exception:
+        pass
+    return actions
+
+
+def _save_macropad_actions(actions):
+    with open(MACROPAD_ACTIONS_FILE, "w") as f:
+        f.write(json.dumps({"actions": actions}, indent=2))
+
+
+def _macropad_int(value, fallback, low=0, high=100):
+    try:
+        return max(low, min(high, int(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _macropad_color(value, fallback=(255, 255, 255)):
+    """One RGB triple, whatever the file happened to contain."""
+    try:
+        r, g, b = value
+    except (TypeError, ValueError):
+        return list(fallback)
+    return [_macropad_int(c, f, 0, 255) for c, f in zip((r, g, b), fallback)]
+
+
+def _load_macropad_rgb():
+    """Lighting state: effect id, brightness, speed, the two effect colours,
+    direction, and the 12 per key colours the Custom effect sends.
+
+    Every field is coerced rather than trusted. The MacroPad screen is built
+    at startup, not on first visit, so a hand edited or truncated file here
+    would otherwise take the whole application down before the window appears.
+    """
+    default = {
+        "effect": 0, "brightness": 60, "speed": 60,
+        "color1": [255, 0, 0], "color2": [0, 0, 255], "direction": 0,
+        "colors": [[255, 255, 255] for _ in range(_MACROPAD_KEYS)],
+    }
+    try:
+        stored = _read_json(MACROPAD_RGB_FILE)
+    except Exception:
+        return default
+    if not isinstance(stored, dict):
+        return default
+
+    out = dict(default)
+    out["effect"]     = _macropad_int(stored.get("effect"), 0, 0, 255)
+    out["brightness"] = _macropad_int(stored.get("brightness"), 60)
+    out["speed"]      = _macropad_int(stored.get("speed"), 60)
+    out["direction"]  = _macropad_int(stored.get("direction"), 0, 0, 255)
+    out["color1"]     = _macropad_color(stored.get("color1"), (255, 0, 0))
+    out["color2"]     = _macropad_color(stored.get("color2"), (0, 0, 255))
+    colors = stored.get("colors")
+    if not isinstance(colors, list):
+        colors = []
+    colors = [_macropad_color(c) for c in colors[:_MACROPAD_KEYS]]
+    out["colors"] = colors + [[255, 255, 255]] * (_MACROPAD_KEYS - len(colors))
+    return out
+
+
+def _save_macropad_rgb(cfg):
+    with open(MACROPAD_RGB_FILE, "w") as f:
+        f.write(json.dumps(cfg, indent=2))
 
 
 # ── Makalu 67 LED storage ───────────────────────────────────────────────────────

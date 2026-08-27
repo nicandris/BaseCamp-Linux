@@ -108,6 +108,7 @@ from devices.everest_max.panel import EverestMaxPanel
 from devices.everest60.panel import Everest60Panel
 from devices.makalu67.panel import Makalu67Panel
 from devices.displaypad.panel import DisplayPadPanel
+from devices.macropad.panel import MacroPadPanel
 from devices.obs.panel import OBSPanel
 from devices.macros.panel import MacroPanel
 from devices.plugins.panel import PluginManagerPanel
@@ -704,7 +705,7 @@ class UpdateAvailableDialog(ctk.CTkToplevel):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 
 # Window size. The minimum is what the widest screen needs: sidebar plus a
 # 6x2 key grid plus the inspector column, measured rather than guessed.
@@ -724,6 +725,8 @@ class App(ctk.CTk):
     MAKALU67_PID        = 0x0003
     DISPLAYPAD_VID      = 0x3282
     DISPLAYPAD_PID      = 0x0009
+    MACROPAD_VID        = 0x3282
+    MACROPAD_PID        = 0x0008
 
     def __init__(self):
         super().__init__()
@@ -780,11 +783,12 @@ class App(ctk.CTk):
 
         self._lang_var = tk.StringVar()
 
-        self._active_device = None   # "everest_max" | "everest60" | "makalu67" | "displaypad"
+        self._active_device = None   # "everest_max" | "everest60" | "makalu67" | "displaypad" | "macropad"
         self._panels        = {}     # populated in _build_ui
         self._kb_panel_id   = "everest_max"   # which keyboard panel is active
         self._dev_present   = {"everest_max": False, "everest60": False,
-                               "makalu67": False, "displaypad": False, "obs": False}
+                               "makalu67": False, "displaypad": False,
+                               "macropad": False, "obs": False}
         # Devices that enumerated but whose /dev nodes we may not open (#49).
         self._dev_denied    = {}
         self._denied_logged = set()
@@ -1256,6 +1260,9 @@ class App(ctk.CTk):
         self._nav_items["displaypad"] = UI.NavItem(
             self._nav_devices_box, text="DisplayPad", state="off",
             command=lambda: self._switch_device("displaypad"))
+        self._nav_items["macropad"] = UI.NavItem(
+            self._nav_devices_box, text="MacroPad", state="off",
+            command=lambda: self._switch_device("macropad"))
 
         self._nav_tools_label = UI.SectionLabel(side, text=self.T("nav_tools"))
         self._reg(self._nav_tools_label, "nav_tools")
@@ -1331,9 +1338,15 @@ class App(ctk.CTk):
         # the window appeared.
         self._obs_panel        = OBSPanel(self._panel_area, self)
         self._displaypad_panel = DisplayPadPanel(self._panel_area, self)
+        # Built up front, not on first visit like the other device screens: it
+        # owns the MacroPad's command interface, and that interface is what
+        # carries key presses. A lazy screen would mean the keys do nothing
+        # until someone happens to open it.
+        self._macropad_panel   = MacroPadPanel(self._panel_area, self)
 
         self._panels = {
             "displaypad": self._displaypad_panel,
+            "macropad":   self._macropad_panel,
             "obs":        self._obs_panel,
         }
         self._panel_factories = {
@@ -1474,6 +1487,9 @@ class App(ctk.CTk):
         elif active == "displaypad":
             show = not self._dev_present.get("displaypad")
             title_key = "no_device_displaypad"
+        elif active == "macropad":
+            show = not self._dev_present.get("macropad")
+            title_key = "no_device_macropad"
         # Present but not openable is worth its own message: the controls are
         # all there and none of them do anything, which is indistinguishable
         # from the application being broken unless we say so (#49).
@@ -1481,7 +1497,7 @@ class App(ctk.CTk):
         if active in ("everest_max", "everest60"):
             denied = (self._dev_denied.get("everest_max")
                       or self._dev_denied.get("everest60"))
-        elif active in ("makalu67", "displaypad"):
+        elif active in ("makalu67", "displaypad", "macropad"):
             denied = self._dev_denied.get(active)
         if not show and denied:
             self._no_device_title.configure(text=self.T("no_access_title"))
@@ -1577,7 +1593,7 @@ class App(ctk.CTk):
                 or self._dev_present.get("everest60")):
             self._switch_device(self._kb_panel_id)
             return
-        for dev in ("makalu67", "displaypad"):
+        for dev in ("makalu67", "displaypad", "macropad"):
             if self._dev_present.get(dev):
                 self._switch_device(dev)
                 return
@@ -1592,9 +1608,11 @@ class App(ctk.CTk):
         mouse_present  = (_check_usb_presence(self.MAKALU67_VID, self.MAKALU67_PID)
                           or _check_usb_presence(self.MAKALU67_VID, 0x0002))
         dp_present     = _check_usb_presence(self.DISPLAYPAD_VID, self.DISPLAYPAD_PID)
+        mkd_present    = _check_usb_presence(self.MACROPAD_VID, self.MACROPAD_PID)
         self._check_device_access(kb_max_present, kb_60_present,
-                                  mouse_present, dp_present)
-        self._update_device_status(kb_max_present, kb_60_present, mouse_present, dp_present)
+                                  mouse_present, dp_present, mkd_present)
+        self._update_device_status(kb_max_present, kb_60_present, mouse_present,
+                                   dp_present, mkd_present)
         self.after(5000, self._check_devices)
 
     # A device node exists for a moment before udev has applied our rule to it,
@@ -1605,7 +1623,7 @@ class App(ctk.CTk):
     # consecutive scans, roughly fifteen seconds, is a real one.
     _ACCESS_STRIKES = 3
 
-    def _check_device_access(self, kb_max, kb_60, mouse, dp):
+    def _check_device_access(self, kb_max, kb_60, mouse, dp, mkd=False):
         """Note devices we can see but not open, and say so once (#49).
 
         A device with root-only /dev nodes, which is what a missing or
@@ -1619,6 +1637,7 @@ class App(ctk.CTk):
              (self.EVEREST60_PID_ANSI, self.EVEREST60_PID_ISO)),
             ("makalu67", mouse, self.MAKALU67_VID, (self.MAKALU67_PID, 0x0002)),
             ("displaypad", dp, self.DISPLAYPAD_VID, (self.DISPLAYPAD_PID,)),
+            ("macropad", mkd, self.MACROPAD_VID, (self.MACROPAD_PID,)),
         )
         for dev_id, present, vid, pids in checks:
             denied = []
@@ -1644,13 +1663,15 @@ class App(ctk.CTk):
                 self._denied_logged.discard(dev_id)
 
     def _update_device_status(self, kb_max_present, kb_60_present=False,
-                               mouse_present=False, dp_present=False):
+                               mouse_present=False, dp_present=False,
+                               mkd_present=False):
         """Update switcher button appearance based on device presence."""
         obs_connected = hasattr(self, "_obs_panel") and self._obs_panel.is_connected()
         self._dev_present["everest_max"] = kb_max_present
         self._dev_present["everest60"]   = kb_60_present
         self._dev_present["makalu67"]    = mouse_present
         self._dev_present["displaypad"]  = dp_present
+        self._dev_present["macropad"]    = mkd_present
         self._dev_present["obs"]         = obs_connected
         # Determine active keyboard panel (Everest 60 takes priority if connected)
         old_kb_id = self._kb_panel_id
@@ -1683,7 +1704,7 @@ class App(ctk.CTk):
         if self._active_device in ("everest_max", "everest60") and not (
                 kb_max_present or kb_60_present):
             self._fall_back_to_present_device()
-        elif (self._active_device in ("makalu67", "displaypad")
+        elif (self._active_device in ("makalu67", "displaypad", "macropad")
               and not self._dev_present.get(self._active_device, False)):
             self._fall_back_to_present_device()
         self._refresh_sidebar()
@@ -1693,6 +1714,8 @@ class App(ctk.CTk):
             self._makalu_panel.set_connected(mouse_present)
         if hasattr(self, "_everest60_panel"):
             self._everest60_panel.set_connected(kb_60_present)
+        if hasattr(self, "_macropad_panel"):
+            self._macropad_panel.set_connected(mkd_present)
         # Reflect (dis)connection in the empty-state overlay
         self._update_empty_state()
 
@@ -1712,11 +1735,12 @@ class App(ctk.CTk):
                       or self._dev_present.get("everest60", False))
         order = (("keyboard", kb_present),
                  ("makalu67", self._dev_present.get("makalu67", False)),
-                 ("displaypad", self._dev_present.get("displaypad", False)))
+                 ("displaypad", self._dev_present.get("displaypad", False)),
+                 ("macropad", self._dev_present.get("macropad", False)))
 
         visible = tuple(key for key, present in order if present)
         # Re-pack only when the list really changed. This runs off the device
-        # scan every five seconds, and taking all three entries out of the box
+        # scan every five seconds, and taking every entry out of the box
         # and putting them back each time is visible as a flicker even though
         # nothing moved. Packing an already-packed widget would move it to the
         # end of the box, hence the full rebuild when it does change.
@@ -1768,7 +1792,7 @@ class App(ctk.CTk):
         dev = self._active_device
         if dev in ("everest_max", "everest60"):
             title = self._nav_items["keyboard"]._label.cget("text")
-        elif dev in ("makalu67", "displaypad"):
+        elif dev in ("makalu67", "displaypad", "macropad"):
             title = self._nav_items[dev]._label.cget("text")
         elif dev == "settings":
             title = self.T("settings_title")
@@ -1781,7 +1805,8 @@ class App(ctk.CTk):
             title = item._label.cget("text") if item is not None else ""
         self._screen_title.configure(text=title)
 
-        is_device = dev in ("everest_max", "everest60", "makalu67", "displaypad")
+        is_device = dev in ("everest_max", "everest60", "makalu67",
+                            "displaypad", "macropad")
         if is_device:
             present = (self._dev_present.get("everest_max") or
                        self._dev_present.get("everest60")) if dev.startswith("everest") \

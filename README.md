@@ -4,38 +4,32 @@
 
 # BaseCamp Linux
 
-> [!IMPORTANT]
-> ### Do you own a Mountain MacroPad? Five minutes of yours would finish the driver.
+> [!NOTE]
+> ### MacroPad support has landed
 >
-> The MacroPad is the 12 key pad with M1 to M12 keycaps and per-key RGB, the one
-> without displays. Its protocol is reverse engineered and implemented: lighting,
-> profiles, key remapping, shortcuts. One piece cannot be worked out from the
-> Windows software, and nobody on this project owns the hardware to measure it:
-> **the exact report the pad sends when you press a key.**
+> Two owners ran `tools/macropad_probe.py` on their pads and sent the reports
+> back in [issue #85](https://github.com/ramisotti13-eng/BaseCamp-Linux/issues/85).
+> That closed the last gap in the protocol, the format of a key press, and the
+> MacroPad now has its own screen with lighting and key actions. Thank you both.
 >
-> If you have one, run this and attach the file it writes to
-> [issue #85](https://github.com/ramisotti13-eng/BaseCamp-Linux/issues/85):
+> The probe stays in the repository. If something on your pad does not behave,
+> running it and attaching the file it writes is still the fastest way to show
+> us what the device is actually doing:
 >
 > ```bash
 > curl -O https://raw.githubusercontent.com/ramisotti13-eng/BaseCamp-Linux/main/tools/macropad_probe.py
 > python3 macropad_probe.py
 > ```
 >
-> Nothing to install: on Linux the script talks to `/dev/hidraw` itself and needs
-> no Python packages. If it reports that it has no permission, run it once as
-> `sudo python3 macropad_probe.py`.
->
 > It reads and does not write: no flash, no key bindings, no firmware, nothing
-> saved on the device. It lists the interfaces, sends the handshake, then asks you
-> to press M1 to M12 one at a time and records the raw reports into a json file.
-> Takes about five minutes. The lighting test is opt-in with `--lighting` and is
-> gone when you unplug the pad.
->
-> With that file, MacroPad support ships in the release after this one.
+> saved on the device. On Linux it talks to `/dev/hidraw` itself and needs no
+> Python packages; if it reports that it has no permission, run it once with
+> `sudo`. The lighting test is opt-in with `--lighting` and is gone when you
+> unplug the pad.
 
 **Unofficial Linux companion app for Mountain peripherals.**
 
-Mountain Base Camp is only available on Windows. This project brings full device control for the **Everest Max keyboard**, **Everest 60 keyboard**, **Makalu 67 mouse**, **Makalu Max mouse** and **DisplayPad** to Linux: display control, RGB lighting, button actions, monitor metrics, DPI, button remapping, multi-page display management and OBS integration.
+Mountain Base Camp is only available on Windows. This project brings full device control for the **Everest Max keyboard**, **Everest 60 keyboard**, **Makalu 67 mouse**, **Makalu Max mouse**, **DisplayPad** and **MacroPad** to Linux: display control, RGB lighting, button actions, monitor metrics, DPI, button remapping, multi-page display management and OBS integration.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux-black) ![License](https://img.shields.io/badge/License-GPL%20v3%20%2B%20Non--Commercial-red)
 
@@ -432,6 +426,59 @@ Click **Open Key Color Editor** to open the per-LED editor. The Makalu 67 has 8 
 
 ---
 
+## MacroPad
+
+<p align="center">
+  <img src="docs/macropad.png" alt="BaseCamp Linux: MacroPad Panel" width="900"/>
+</p>
+
+The **MacroPad** (PID `0x0008`) is the DisplayPad's chassis with plain keycaps:
+twelve mechanical keys labelled M1 to M6 on the top row and M7 to M12 below,
+per key RGB, no displays. Its screen appears in the sidebar as soon as the pad
+is plugged in.
+
+There is no image upload here and no page system: the keys are ordinary
+keycaps, so there is nothing to draw on. What a MacroPad key can do is
+everything a DisplayPad key can do apart from the two things that need a
+screen. If you are looking for button images, GIFs, fullscreen mode or
+multiple pages, that is the [DisplayPad](#displaypad).
+
+### Key Actions (M1 to M12)
+
+Click a key in the grid, pick what it should do, and save. The same action
+types the DisplayPad offers, minus the ones that need a screen:
+
+| Type | What it does |
+|------|--------------|
+| Shell | Runs a command |
+| URL | Opens an address in the browser |
+| Folder | Opens a folder in the file manager |
+| App | Starts a program |
+| OBS | `scene:<name>`, `record` or `stream` |
+| Macro | Runs a macro from the Macros screen |
+| Keypress | Sends a key combination, e.g. `ctrl+shift+m` |
+| Text | Types a piece of text |
+
+Plugin action types show up in the same menu. Bindings are stored in
+`~/.config/mountain-time-sync/macropad_actions.json` and are read by the app,
+not written to the pad, so they take effect while BaseCamp Linux is running.
+
+The pad reports a key press on its vendor interface; the app decodes it and
+runs the action. Each key has a short debounce so one press is one action.
+
+### RGB Lighting
+
+- Effects: Static, Breathing, Wave, Tornado, Matrix, Yeti, Reactive A / B / C,
+  Custom, Off
+- Brightness and speed, and one or two colours depending on the effect
+- **Custom** lights every key in its own colour: pick a key, set its colour in
+  the inspector, then apply. The strip under each key in the grid shows the
+  colour it will get.
+- **Save to pad** writes the current state into the pad's flash, so it survives
+  a replug without the app running.
+
+---
+
 ## Custom RGB Mode: Keyboard
 
 <p align="center">
@@ -653,6 +700,8 @@ python3 gui.py
 ```
 
 Two packages are optional and only unlock extras: `tkinterdnd2` for dragging image files onto button tiles, and `python-xlib` as a fallback for reading the cursor position on X11 when `xdotool` is not installed. Both soft-fail, the app starts fine without them.
+
+> **About `hid`:** two unrelated PyPI packages install a module of that name, `hid` and `hidapi`, and they have different APIs. Either works; distribution packages such as `python3-hid` or `python-hidapi` are usually the second one. The app handles both (`shared/hid_compat.py`), so install whichever your system offers.
 
 > **GPU monitoring** requires `nvidia-smi` (NVIDIA only).
 

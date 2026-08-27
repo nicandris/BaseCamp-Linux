@@ -39,14 +39,18 @@ Custom per-LED mode (effect=0x0F), confirmed by USB capture:
     LED[2]    LED[5]
     LED[3] ·· LED[4]
 """
+import os
 import sys
 import time
 
-try:
-    import hid
-    HID_AVAILABLE = True
-except ImportError:
-    HID_AVAILABLE = False
+# The device controllers also run as standalone scripts (the app spawns them
+# as subprocesses), so the repository root is not on sys.path by itself.
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from shared import hid_compat
+HID_AVAILABLE = hid_compat.HID_AVAILABLE
 
 VID = 0x3282
 PID_67  = 0x0003   # Makalu 67
@@ -141,7 +145,7 @@ def detect_model():
     if not HID_AVAILABLE:
         return None, None
     for pid, name in [(PID_67, "Makalu 67"), (PID_MAX, "Makalu Max")]:
-        for d in hid.enumerate(VID, pid):
+        for d in hid_compat.enumerate(VID, pid):
             if d.get('interface_number') == 1:
                 PID = pid
                 if pid == PID_MAX:
@@ -159,7 +163,7 @@ def find_path():
     if not HID_AVAILABLE:
         return None
     for pid in (PID_67, PID_MAX):
-        for d in hid.enumerate(VID, pid):
+        for d in hid_compat.enumerate(VID, pid):
             if d.get('interface_number') == 1:
                 return d['path']
     return None
@@ -169,7 +173,7 @@ def open_device():
     path = find_path()
     if path is None:
         raise RuntimeError("Makalu mouse not found (VID=0x3282 PID=0x0003/0x0002 IF1)")
-    dev = hid.Device(path=path)
+    dev = hid_compat.open_path(path)
     return dev
 
 

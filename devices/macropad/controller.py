@@ -6,7 +6,7 @@ VID: 0x3282, PID: 0x0008
 
 Protocol: vendor HID collection (Usage Page 0xFF00, Usage 0x01).
 Reports are 64 payload bytes plus a leading Report ID 0x00, so 65 bytes go
-into hid.Device.write(), exactly like the DisplayPad command interface.
+into the HID write, exactly like the DisplayPad command interface.
 
 Reverse-engineered on 2026-08-11 from Mountain Base Camp for Windows
 (MacroPadSDK.dll disassembly plus the BaseCamp.Service.exe decompile).
@@ -20,11 +20,14 @@ for the DisplayPad and the Everest. So the method is sound. What is NOT
 verified is this device: nobody on the team owns a MacroPad. Every packet
 below is built from the SDK, not from a capture.
 
-The one genuine gap is the key event input report. The SDK hands key presses
-to a callback as (matrix, pressed) after decoding them inside a HID helper
-class that could not be read statically. decode_key_event() below implements
-the DisplayPad format as a hypothesis and says so. tools/macropad_probe.py
-exists to collect that missing piece from someone who owns the device.
+The one gap the disassembly left, the key event input report, is closed. The
+SDK hands key presses to a callback as (matrix, pressed) after decoding them
+inside a HID helper class that could not be read statically, so
+tools/macropad_probe.py went out to collect it from owners instead. Two dumps
+came back in issue #85, from different distributions and different firmware
+builds, and they agree byte for byte; KEY_MAP below is that measurement.
+Still unverified on hardware: the lighting commands, since neither dump ran
+the probe's opt-in --lighting pass.
 
 Command summary (payload offsets, Report ID not counted):
 
@@ -43,13 +46,17 @@ Command summary (payload offsets, Report ID not counted):
 Acknowledgement: response[0] == 0xFF and response[1] == 0xAA, except for
 commands that echo their own arguments instead (switch_profile does).
 """
+import os
+import sys
 import time
 
-try:
-    import hid
-    HID_AVAILABLE = True
-except ImportError:
-    HID_AVAILABLE = False
+# Also importable as a standalone script, like the other device controllers.
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from shared import hid_compat
+HID_AVAILABLE = hid_compat.HID_AVAILABLE
 
 VID = 0x3282
 PID = 0x0008
@@ -318,29 +325,37 @@ def is_ack(response):
         response[0] == 0xFF and response[1] == 0xAA
 
 
+# Key state map, measured on real hardware (issue #85). Two owners on
+# different distributions and different firmware builds sent probe dumps that
+# agree byte for byte, and both match the DisplayPad map in
+# devices/displaypad/panel.py, gap and unused bit included: M1 to M7 live in
+# byte 42 starting at bit 1, M8 to M12 in byte 47 starting at bit 0.
+KEY_MAP = (
+    [(42, mask) for mask in (0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80)] +
+    [(47, mask) for mask in (0x01, 0x02, 0x04, 0x08, 0x10)]
+)
+
+# The highest byte the map touches, so a truncated read is dropped rather than
+# silently read as "nothing pressed".
+KEY_EVENT_MIN_LEN = max(byte for byte, _ in KEY_MAP) + 1
+
+
 def is_key_event(response):
-    """Hypothesis, not verified: the DisplayPad marks key state reports with
-    0x01 in byte 0 and our driver filters on exactly that. Same firmware
-    family, same key count, so it is the sensible starting point. Confirm with
-    tools/macropad_probe.py before anyone relies on it."""
-    return bool(response) and response[0] == 0x01
+    """Key state reports carry 0x01 in byte 0, like the DisplayPad. Confirmed
+    on hardware by both probe dumps in issue #85."""
+    return bool(response) and len(response) >= KEY_EVENT_MIN_LEN and \
+        response[0] == 0x01
 
 
 def decode_key_event(response):
-    """Turn a key state report into a set of pressed key indices.
+    """Turn a key state report into a set of pressed key indices (0 to 11).
 
-    UNVERIFIED, see is_key_event(). The DisplayPad packs 12 keys as one bit
-    each starting at byte 1; that layout is assumed here. If the probe shows
-    something else, this function is the only place that has to change."""
+    Releasing sends the same report with every key bit cleared, so an empty
+    set is a real answer and not an error."""
     if not is_key_event(response):
         return set()
-    pressed = set()
-    for index in range(NUM_KEYS):
-        byte = 1 + index // 8
-        bit = index % 8
-        if byte < len(response) and response[byte] & (1 << bit):
-            pressed.add(index)
-    return pressed
+    return set(index for index, (byte, mask) in enumerate(KEY_MAP)
+               if response[byte] & mask)
 
 
 # ── Device discovery ──────────────────────────────────────────────────────────
@@ -349,7 +364,7 @@ def enumerate_interfaces():
     """Every HID interface the MacroPad exposes, as hidapi reports them."""
     if not HID_AVAILABLE:
         return []
-    return list(hid.enumerate(VID, PID))
+    return hid_compat.enumerate(VID, PID)
 
 
 def find_path():
@@ -388,13 +403,15 @@ class MacroPad:
 
     def __init__(self, path=None):
         if not HID_AVAILABLE:
-            raise RuntimeError("hidapi not installed (pip install hid)")
+            raise RuntimeError(
+                "no usable 'hid' module; install the 'hid' or the 'hidapi' "
+                "package (see shared/hid_compat.py)")
         if path is None:
             path = find_path()
         if path is None:
             raise RuntimeError(
                 "MacroPad not found (VID=0x%04X PID=0x%04X)" % (VID, PID))
-        self.dev = hid.Device(path=path)
+        self.dev = hid_compat.open_path(path)
         self.dev.nonblocking = False
         self.key_events = []
 

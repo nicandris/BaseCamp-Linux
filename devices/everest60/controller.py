@@ -34,14 +34,18 @@ Direct color mode (custom per-key):
           byte[3] of each entry = LED hardware index (LEDIDX mapping)
   End:    cmd=0x36
 """
+import os
 import sys
 import time
 
-try:
-    import hid
-    HID_AVAILABLE = True
-except ImportError:
-    HID_AVAILABLE = False
+# The device controllers also run as standalone scripts (the app spawns them
+# as subprocesses), so the repository root is not on sys.path by itself.
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from shared import hid_compat
+HID_AVAILABLE = hid_compat.HID_AVAILABLE
 
 VID         = 0x3282
 PID_ANSI    = 0x0005
@@ -107,7 +111,7 @@ def detect_model():
         return None, None
 
     for pid, name in [(PID_ANSI, "Everest 60"), (PID_ISO, "Everest 60 ISO")]:
-        for d in hid.enumerate(VID, pid):
+        for d in hid_compat.enumerate(VID, pid):
             if d.get('interface_number') == INTERFACE:
                 PID = pid
                 return pid, name
@@ -119,7 +123,7 @@ def find_path():
     if not HID_AVAILABLE:
         return None
     for pid in (PID_ANSI, PID_ISO):
-        for d in hid.enumerate(VID, pid):
+        for d in hid_compat.enumerate(VID, pid):
             if d.get('interface_number') == INTERFACE:
                 return d['path']
     return None
@@ -129,7 +133,7 @@ def open_device():
     path = find_path()
     if path is None:
         raise RuntimeError("Everest 60 not found (VID=0x3282 PID=0x0005/0x0006 IF2)")
-    dev = hid.Device(path=path)
+    dev = hid_compat.open_path(path)
     return dev
 
 

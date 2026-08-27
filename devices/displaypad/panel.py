@@ -54,11 +54,8 @@ def _dbg(msg):
         print(msg, flush=True)
 
 
-try:
-    import hid
-    HID_AVAILABLE = True
-except ImportError:
-    HID_AVAILABLE = False
+from shared import hid_compat
+HID_AVAILABLE = hid_compat.HID_AVAILABLE
 
 try:
     import usb.core
@@ -126,7 +123,7 @@ def _open_interfaces():
     # libusb refcount assertion when old Python objects haven't been collected yet.
     gc.collect()
     device_path = None
-    for d in hid.enumerate(VID, PID):
+    for d in hid_compat.enumerate(VID, PID):
         if d['interface_number'] == 3:
             device_path = d['path']
             break
@@ -140,7 +137,7 @@ def _open_interfaces():
     for attempt in range(3):
         hid_dev = None
         try:
-            hid_dev = hid.Device(path=device_path)
+            hid_dev = hid_compat.open_path(device_path)
             hid_dev.nonblocking = False
             usb_dev = usb.core.find(idVendor=VID, idProduct=PID)
             if usb_dev is None:
@@ -3124,9 +3121,9 @@ class DisplayPadPanel(ctk.CTkFrame):
         def _apply():
             try:
                 dev_path = next(
-                    d['path'] for d in __import__('hid').enumerate(VID, PID)
+                    d['path'] for d in hid_compat.enumerate(VID, PID)
                     if d['interface_number'] == 3)
-                h = __import__('hid').Device(path=dev_path)
+                h = hid_compat.open_path(dev_path)
                 try:
                     _set_brightness(h, pct)
                 finally:
@@ -4726,7 +4723,7 @@ class DisplayPadPanel(ctk.CTkFrame):
             path = None
             if HID_AVAILABLE:
                 try:
-                    for d in hid.enumerate(VID, PID):
+                    for d in hid_compat.enumerate(VID, PID):
                         if d['interface_number'] == 3:
                             path = d['path']
                             break
