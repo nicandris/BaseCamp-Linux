@@ -508,6 +508,7 @@
   "meter_ram": "RAM",
   "meter_disk": "Disk",
   "meter_net": "Net MB/s",
+  "meter_volume": "Volume",
   "main_display_image_label": "Image",
   "pluginmgr_pick_hint": "Pick a plugin on the left",
   "pluginmgr_author": "Author: {name}",

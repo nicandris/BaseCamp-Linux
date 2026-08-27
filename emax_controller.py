@@ -88,6 +88,18 @@ def _read(dev, timeout=1000):
     except usb.core.USBTimeoutError:
         return _EMPTY_PKT
 
+# ── System volume ──────────────────────────────────────────────────────────
+#
+# The wheel display's Volume mode (0x71) shows whatever the host last pushed
+# over `11 83 00 00 <level>`. The firmware does not track the system level on
+# its own — its wheel is an ordinary HID consumer control — so without this the
+# readout drifts from the real volume and ignores any change made elsewhere.
+
+from shared.volume import (system_volume as _system_volume,
+                           start_watch as _start_volume_watch)
+
+VOLUME_CMD = 0x83
+
 def icon_id(button_idx, variant):
     """Return the icon_id for a given button (0-3) and variant (0-8)."""
     return ICON_BASE + button_idx * ICONS_PER_BTN + variant
@@ -872,6 +884,7 @@ def controller_loop(style=STYLE_ANALOG):
         obs_cfg = _load_obs_config()
         obs_holder = [None]
         psutil.cpu_percent()
+        _start_volume_watch()
         _net_prev = psutil.net_io_counters()
         _net_prev_time = time.monotonic()
         _gpu_cache = 0
@@ -1077,6 +1090,18 @@ def controller_loop(style=STYLE_ANALOG):
                 for metric_type in range(5):
                     value = min(int(_smooth[metric_type]), 999)
                     dev.write(EP_OUT, make_packet(0x11, 0x81, metric_type, 0x00, value))
+                    _handle_btn_resp(_read(dev, timeout=150))
+
+                # Volume rides its own command, not a metric slot — the board
+                # accepts exactly six slots (0-4 above, 5 is APM) and rejects
+                # anything else with `ff aa`.
+                # Read it here, not on a timer: a stale level pushed after a
+                # wheel turn overwrites what the firmware just displayed, and
+                # the screen snaps back to the old number.
+                vol = _system_volume()
+                if vol is not None:
+                    dev.write(EP_OUT, make_packet(0x11, VOLUME_CMD, 0x00, 0x00,
+                                                  vol))
                     _handle_btn_resp(_read(dev, timeout=150))
             except usb.core.USBError:
                 pass  # Transient USB error — skip this cycle

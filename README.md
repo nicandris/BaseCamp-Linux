@@ -331,8 +331,8 @@ Save that as `~/.config/autostart/basecamp-linux.desktop`. If you installed from
 The keyboard panel is split into a persistent **dashboard** at the top and collapsible sections below:
 
 - **Dashboard**: Live clock display with 24H/12H toggle, language switcher (DE/EN + custom), Analog/Digital display style, splash screen and autostart toggles
-- **Monitor Mode**: Start/stop live keyboard display with CPU%, GPU%, RAM%, HDD% and Network MB/s metrics
-- **Main Display**: Switch between image and clock mode, upload any image to the keyboard's main display, automatically converted to the correct format
+- **Monitor Mode**: Start/stop live keyboard display with CPU%, GPU%, RAM%, HDD%, Network MB/s and volume metrics
+- **Main Display**: Switch between image, clock, volume and the metric modes, upload any image to the keyboard's main display, automatically converted to the correct format. Volume mode needs Monitor Mode running, which is what sends the level to the keyboard
 - **Numpad Keys**: Assign actions (Shell, URL, Folder, App, OBS, Macro, Keypress, Text, Page navigation, Redefine key) and custom button images (including GIF frame picker) to D1–D4, automatically converted to the correct format
 - **RGB Lighting**: Control keyboard RGB effects (Wave, Tornado, Reactive, Yeti, Matrix, and more) with speed, brightness, color and direction. Settings are saved automatically
 - **Custom RGB Mode**: Per-key color editor: click or drag-select keys, assign colors, use the eyedropper (Alt+click), undo (Ctrl+Z), and save/load named presets. Side LEDs are fully selectable around both keyboard and numpad bezels (see [Custom RGB Mode: Keyboard](#custom-rgb-mode-keyboard) below)
@@ -341,7 +341,7 @@ The keyboard panel is split into a persistent **dashboard** at the top and colla
 
 - **Display styles**: Switch between Analog and Digital clock on the keyboard display
 - **24H / 12H**: Toggle clock format
-- **Monitor mode**: Live metrics on the keyboard display: CPU%, GPU%, RAM%, HDD%, Network MB/s
+- **Monitor mode**: Live metrics on the keyboard display: CPU%, GPU%, RAM%, HDD%, Network MB/s, and the system volume of whichever output device is selected
 - **Button actions (D1–D4)**: Assign Shell commands, URLs, folders, installed apps, OBS actions, Macros, Keypresses, arbitrary Text, a jump to another tab or a redefine of another key to D1–D4, with a native folder picker, searchable app picker and OBS scene selector. Actions save immediately on change. Use **Reset Buttons Flash** after first setup or when switching from Mountain Base Camp. BaseCamp may have stored its own actions in the keyboard's flash memory, which can cause two actions to fire on a single button press. Reset Buttons Flash overwrites all four slots with your configured actions, clearing any leftover BaseCamp data.
 - **Image upload (D1–D4)**: Upload images to D-buttons via the **Upload Images** dialog or individual per-slot upload buttons, automatically converted and resized (GIF frame picker included). Images are saved to the **Image Library** for quick reuse.
 - **Image Library**: All uploaded images are stored locally as thumbnails. Pick from previously used images with one click instead of browsing the file system every time. Images can be deleted from the library individually.
