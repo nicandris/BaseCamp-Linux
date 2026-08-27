@@ -65,17 +65,29 @@ def _read():
     return parse_wpctl_volume(out.strip())
 
 
+try:
+    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+except Exception:                         # not Linux, or no glibc
+    _libc = None
+
+PR_SET_PDEATHSIG = 1
+
+
 def _die_with_parent():
     """Ask the kernel to signal this child when its parent dies.
 
     The watcher thread is a daemon, so it is killed outright when the monitor
     process ends and its `finally` never runs. Without this every start and
     stop of Monitor Mode would strand a `pactl subscribe` process.
+
+    This runs in the forked child, between fork and exec, where almost nothing
+    is safe to do: another thread may have held the dynamic loader's lock at
+    the moment of the fork, and loading a library here would then deadlock a
+    child that can never be reaped. `libc` is therefore resolved above, in the
+    parent, and this only calls through the pointer.
     """
-    try:
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)
-    except Exception:
-        pass                              # not fatal, only untidy
+    if _libc is not None:
+        _libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
 
 def _watch_loop():
@@ -107,8 +119,10 @@ def start_watch():
     global _watcher, _level
     if _watcher is not None and _watcher.is_alive():
         return
-    with _lock:
-        _level = _read()                  # seed, so the first push is correct
+    seed = _read()                        # outside the lock: this forks a process
+    if seed is not None:
+        with _lock:
+            _level = seed
     _watcher = threading.Thread(target=_watch_loop, daemon=True)
     _watcher.start()
 
@@ -126,7 +140,9 @@ def system_volume():
     now = time.monotonic()
     if now - _last_poll >= POLL_INTERVAL:
         _last_poll = now
-        with _lock:
-            _level = _read()
+        value = _read()
+        if value is not None:             # a failed read keeps the last good
+            with _lock:                   # level rather than blanking the
+                _level = value            # display
     with _lock:
         return _level
