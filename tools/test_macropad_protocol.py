@@ -305,6 +305,22 @@ except ValueError:
     print("ok    block command refuses static     the DLL refuses it too")
 
 
+# ── The customize table, the step that was missing entirely ──────────────────
+table = mp.pkt_customize_table()
+verify("customize table is 14 a0", table[:4] == bytes([0x14, 0xA0, 0x00, 0x01]),
+       table[:4].hex(" "))
+verify("twelve entries from offset 4, all Static",
+       list(table[4:16]) == [mp.EFFECT_STATIC] * mp.NUM_KEYS
+       and table[16:] == bytes(mp.PAYLOAD_LEN - 16), list(table[4:16]))
+custom = mp.pkt_customize_table([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+verify("and it takes a table of its own", list(custom[4:16]) == list(range(1, 13)),
+       list(custom[4:16]))
+try:
+    mp.pkt_customize_table([0, 0, 0])
+    failures.append("pkt_customize_table accepted a short table")
+    print("FAIL  short table rejected")
+except ValueError:
+    print("ok    short table                       rejected")
 # ── Stored settings must never take the application down ─────────────────────
 # The MacroPad screen is built at startup, not on first visit, so anything
 # that raises while reading its config file stops the window from appearing.
@@ -395,6 +411,8 @@ pairs = [
     ("probe tornado, block form", probe.block_effect_packet(7, direction=10),
      mp.pkt_block_effect(mp.EFFECT_TORNADO, brightness=60, speed=60,
                          color1=(255, 0, 0), direction=0)),
+    ("probe customize table", probe.customize_table_packet(),
+     mp.pkt_customize_table()),
     ("probe custom activate", probe.custom_activate_packet(70),
      mp.pkt_custom_activate(70)),
 ]

@@ -743,11 +743,14 @@ def test_lighting(link):
             questions.append((name, question))
         time.sleep(1.6)
 
-    # The custom path, in Base Camp's order: activate first, then the colours.
-    # The other way round was tried in #85 and stayed dark.
+    # The custom path, in Base Camp's order and with the step that was missing
+    # altogether: activate, then the colours, then the table that says which
+    # effect each key runs. Activate-then-colours alone was tried in #85 and
+    # still stayed dark.
     print()
     for name, packet in (("custom effect on", custom_activate_packet()),
-                         ("per-key colours", per_key_packet())):
+                         ("per-key colours", per_key_packet()),
+                         ("customize table", customize_table_packet())):
         replies = link.ask(packet, timeout_ms=400)
         results[name] = [hexs(r) for r in replies]
         print("  %-20s sent, %d reply/replies" % (name, len(replies)))
@@ -761,7 +764,7 @@ def test_lighting(link):
     report["lighting"]["visible_change"] = ask_yes_no(
         "Did the static colours light the pad?")
     report["lighting"]["per_key_worked"] = ask_yes_no(
-        "Did the last two steps light the 12 keys in different colours?")
+        "Did the last three steps light the 12 keys in different colours?")
 
 
 def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
@@ -809,6 +812,21 @@ def per_key_packet():
     for red, green, blue in palette:
         packet[offset], packet[offset + 1], packet[offset + 2] = red, green, blue
         offset += 3
+    return bytes(packet)
+
+
+def customize_table_packet():
+    """`SetCustomizeTable`: which effect each of the twelve keys runs.
+
+    `14 A0`, chunk in byte 2, `0x01` in byte 3, twelve bytes from offset 4.
+    All zeroes is effect 0, Static, on every key, which is what should make
+    the colours from the previous step visible.
+    """
+    packet = bytearray(PAYLOAD_LEN)
+    packet[0] = 0x14
+    packet[1] = 0xA0
+    packet[2] = 0x00
+    packet[3] = 0x01
     return bytes(packet)
 
 

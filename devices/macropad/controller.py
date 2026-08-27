@@ -46,6 +46,7 @@ Command summary (payload offsets, Report ID not counted):
   14 2C  [2:64]=EffData              lighting effect (62 byte struct)
   14 2C  [2:64]=BlockData            Wave and Tornado, a different struct
   14 2C 00 01 [4]=chunk [5]=4B       per-key static colours at offset 7
+  14 A0  [2]=chunk [3]=01 [4:16]      which effect each of the 12 keys runs
 
 Acknowledgement: response[0] == 0xFF and response[1] == 0xAA, except for
 commands that echo their own arguments instead (switch_profile does).
@@ -389,6 +390,36 @@ def pkt_custom_colors(colors, chunk=0):
     return bytes(p)
 
 
+def pkt_customize_table(values=None):
+    """`SetCustomizeTable`: which effect each of the 12 keys runs.
+
+    `14 A0`, chunk index in byte 2, `0x01` in byte 3, then the twelve bytes at
+    offset 4, one per key. Disassembled from the export's worker, which memsets
+    a 64 byte buffer, writes `14 a0`, puts `(chunk | 0x0100)` as a word at
+    offset 2 and copies the 12 byte table to offset 4 in a single chunk.
+
+    This is the step the driver was missing entirely. @Thargorrr's second run
+    in #85 had the corrected order already and the custom colours still stayed
+    dark, so the order was necessary and not sufficient.
+
+    All zeroes means every key runs effect 0, Static, which is what "show the
+    twelve colours I just uploaded" should be. That last part is a reading of
+    Base Camp's call site rather than something measured.
+    """
+    if values is None:
+        values = [EFFECT_STATIC] * NUM_KEYS
+    if len(values) != NUM_KEYS:
+        raise ValueError("need exactly %d entries" % NUM_KEYS)
+    p = _pkt()
+    p[0] = 0x14
+    p[1] = 0xA0
+    p[2] = 0x00                      # chunk index
+    p[3] = 0x01
+    for i, value in enumerate(values):
+        p[4 + i] = int(value) & 0xFF
+    return bytes(p)
+
+
 def pkt_remap_key(source, target):
     """Remap key `source` (0-11) to HID key code `target`."""
     p = _pkt()
@@ -583,14 +614,16 @@ class MacroPad:
         colours. @Thargorrr's run in #85 sent the colours first and then
         activated, both packets were accepted, and the pad stayed dark.
 
-        Still missing from this sequence, and the reason to expect it may
-        not be enough on its own: Base Camp follows the colours with
-        SaveFlash, reads the customize table back with GetCustomizeTable,
-        sends a ChangeEffect, and writes the table again with
-        SetCustomizeTable. The wire format of that last one is not worked out.
+        The table write at the end is the step that was missing altogether.
+        His second run had the corrected order and still stayed dark, so the
+        order alone was not it. Base Camp also calls SaveFlash twice in this
+        sequence; that is left to the Save to pad button rather than done
+        behind the person's back on every colour change.
         """
         self.command(pkt_custom_activate(brightness))
-        return self.command(pkt_custom_colors(colors))
+        response = self.command(pkt_custom_colors(colors))
+        self.command(pkt_customize_table())
+        return response
 
     def set_effect_auto(self, effect, **kwargs):
         """Send an effect over whichever of the two commands it belongs to."""
