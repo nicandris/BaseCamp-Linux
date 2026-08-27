@@ -703,83 +703,6 @@ def effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0)):
     return bytes(packet)
 
 
-def test_lighting(link):
-    """Walk the lighting commands and ask which of them the pad actually shows.
-
-    The first run of this (issue #85) found that Static works and Wave and the
-    per key colours do not. Reading the Windows software afterwards turned up
-    two candidate reasons, so this now sends the old form and the new one and
-    asks about each. The pad answers every one of these packets either way;
-    only a person looking at it can say which lit up.
-    """
-    section("Lighting")
-    print("Nothing here is written to flash. Unplug the pad to undo it.")
-    print("Watch the pad. You will be asked which steps you saw.")
-    print("Each step is held for %g seconds; --hold changes that.\n" % LIGHT_HOLD)
-
-    steps = [
-        ("backlight on", bytes([0x12, 0x03]) + bytes(PAYLOAD_LEN - 2), None),
-        ("static red", effect_packet(0, color=(255, 0, 0)), None),
-        ("static green", effect_packet(0, color=(0, 255, 0)), None),
-        ("static blue", effect_packet(0, color=(0, 0, 255)), None),
-        # Wave, the way it was sent before: the ChangeEffect struct.
-        ("wave, old form", effect_packet(4),
-         "Did 'wave, old form' light the pad?"),
-        # Three shapes of the block form. A single block of width 0 sweeps once
-        # and, on the pad, appeared not to come back; width 2 is what the
-        # service's own builder produces before the SDK overwrites it; and a
-        # two colour wave is a different thing again, four stops spaced along
-        # the strip. One run says which of them repeats.
-        ("wave, one colour width 0", block_effect_packet(4, direction=6),
-         "'wave, one colour width 0': did it keep moving, rather than "
-         "sweeping once and stopping?"),
-        ("wave, one colour width 2",
-         block_effect_packet(4, direction=6, width=2),
-         "'wave, one colour width 2': did it keep moving, rather than "
-         "sweeping once and stopping?"),
-        ("wave, two colours",
-         block_effect_packet(4, direction=6, color=(255, 0, 0),
-                             color2=(0, 0, 255)),
-         "'wave, two colours': did it keep moving, rather than "
-         "sweeping once and stopping?"),
-        ("tornado, block form", block_effect_packet(7, direction=10),
-         "Did 'tornado, block form' light the pad?"),
-    ]
-
-    results = {}
-    questions = []
-    for name, packet, question in steps:
-        replies = link.ask(packet, timeout_ms=400)
-        results[name] = [hexs(r) for r in replies]
-        print("  %-20s sent, %d reply/replies" % (name, len(replies)))
-        if question:
-            questions.append((name, question))
-        time.sleep(LIGHT_HOLD)
-
-    # The custom path, in Base Camp's order and with the step that was missing
-    # altogether: activate, then the colours, then the table that says which
-    # effect each key runs. Activate-then-colours alone was tried in #85 and
-    # still stayed dark.
-    print()
-    for name, packet in (("custom effect on", custom_activate_packet()),
-                         ("per-key colours", per_key_packet()),
-                         ("customize table", customize_table_packet())):
-        replies = link.ask(packet, timeout_ms=400)
-        results[name] = [hexs(r) for r in replies]
-        print("  %-20s sent, %d reply/replies" % (name, len(replies)))
-        time.sleep(LIGHT_HOLD)
-
-    report["lighting"] = results
-    print()
-    for name, question in questions:
-        report["lighting"]["saw_" + name.replace(", ", "_").replace(" ", "_")] = \
-            ask_yes_no(question)
-    report["lighting"]["visible_change"] = ask_yes_no(
-        "Did the static colours light the pad?")
-    report["lighting"]["per_key_worked"] = ask_yes_no(
-        "Did the last three steps light the 12 keys in different colours?")
-
-
 LIGHT_HOLD = 8.0        # seconds to hold each lighting step, see --hold
 
 
@@ -790,6 +713,10 @@ def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
     Same `14 2C` command as an ordinary effect, different 62 byte struct:
     byBlockNum sits after byWidth, so the colours start one byte later, and
     byDirection and byWidth carry real values instead of 0xFF.
+
+    The colours are FWBColor here, four bytes each, a leading `pos` and then
+    r, g, b. An early run of this put the colour one byte early, which is why
+    the pad lit white instead of red.
     """
     packet = bytearray(PAYLOAD_LEN)
     packet[0] = 0x14
@@ -800,12 +727,6 @@ def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
     packet[5] = max(0, min(100, brightness))
     packet[6] = 0                         # byRandColor: single colour
     packet[7] = int(direction) & 0xFF
-    # byWidth 0, not 2. getChangeBlockEffect builds it as 2 and the SDK's own
-    # wrapper overwrites it with 0 for both of these effects. With 2 the wave
-    # lit in the right colour and stood still.
-    # FWBColor is four bytes, a leading `pos` and then r, g, b. An early run
-    # put the colour one byte early, which is why the pad lit white instead of
-    # red. The SDK writes 100 into the first pos and 0xFF into the second.
     if color2 is not None:
         # A two colour wave: the pair repeated, spaced along the strip.
         packet[8] = 2 if width is None else width
@@ -816,6 +737,8 @@ def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
             packet[at] = pos
             packet[at + 1], packet[at + 2], packet[at + 3] = (c & 0xFF for c in rgb)
         return bytes(packet)
+    # byWidth 0, not 2: getChangeBlockEffect builds it as 2 and the SDK's own
+    # wrapper overwrites it with 0 for both of these effects.
     packet[8] = 0 if width is None else width
     packet[9] = 1                         # byBlockNum
     packet[10] = 100
@@ -824,11 +747,163 @@ def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
     return bytes(packet)
 
 
+def effect_packet2(effect, brightness=60, speed=60, color=(255, 0, 0),
+                   color2=None):
+    """An EffData effect, with the option of a second colour.
+
+    EffData carries FWColor, three bytes each, so the two colours sit back to
+    back at offsets 9 and 12. That is not the same as the block effects, where
+    a colour is four bytes.
+    """
+    packet = bytearray(effect_packet(effect, brightness, speed, color))
+    if color2 is not None:
+        packet[6] = 16                    # byRandColor: two colours
+        packet[12], packet[13], packet[14] = (c & 0xFF for c in color2)
+    return bytes(packet)
+
+
+# Every step the lighting pass walks through: a name, the packet, and what to
+# ask about it afterwards. A question of None means the step is setup rather
+# than something to judge.
+#
+# It covers all eleven effects rather than the four that had been tried by the
+# third round of #85, because asking one question per round and waiting a day
+# for the answer is a poor way to spend a tester's patience.
+def lighting_steps():
+    red, green, blue, white = (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)
+    return [
+        ("backlight on", bytes([0x12, 0x03]) + bytes(PAYLOAD_LEN - 2), None),
+
+        ("static red", effect_packet(0, color=red), "static red"),
+        ("static green", effect_packet(0, color=green), "static green"),
+        ("static blue", effect_packet(0, color=blue), "static blue"),
+        ("static dim", effect_packet(0, brightness=10, color=white),
+         "static, dim white"),
+        ("static bright", effect_packet(0, brightness=100, color=white),
+         "static, bright white"),
+
+        ("breathing one colour", effect_packet2(1, color=red),
+         "breathing in red"),
+        ("breathing two colours", effect_packet2(1, color=red, color2=blue),
+         "breathing between red and blue"),
+
+        # Wave: the shape is still open. The old form is kept as the control.
+        ("wave old form", effect_packet(4), "wave, the form that never worked"),
+        ("wave one colour width 0", block_effect_packet(4, direction=6),
+         "wave in red, one block"),
+        ("wave one colour width 2",
+         block_effect_packet(4, direction=6, width=2),
+         "wave in red, one block, other width"),
+        ("wave two colours",
+         block_effect_packet(4, direction=6, color=red, color2=blue),
+         "wave between red and blue, four blocks"),
+        ("wave other direction",
+         block_effect_packet(4, direction=2), "wave, the other way"),
+
+        ("tornado", block_effect_packet(7, direction=10), "tornado in red"),
+        ("tornado other direction", block_effect_packet(7, direction=9),
+         "tornado, the other way"),
+
+        ("matrix", effect_packet2(9, color=green, color2=white), "matrix"),
+        ("yeti", effect_packet2(6, color=blue, color2=white), "yeti"),
+
+        # These three only light where a key is pressed.
+        ("reactive A", effect_packet2(3, color=red, color2=blue),
+         "reactive A, press some keys now"),
+        ("reactive B", effect_packet2(5, color=red, color2=blue),
+         "reactive B, press some keys now"),
+        ("reactive C", effect_packet2(11, color=red, color2=blue),
+         "reactive C, press some keys now"),
+    ]
+
+
+def custom_steps():
+    """The three packets of the per key path, in Base Camp's order."""
+    return [
+        ("custom effect on", custom_activate_packet(), None),
+        ("per-key colours", per_key_packet(), None),
+        ("customize table", customize_table_packet(),
+         "the twelve keys, each in its own colour"),
+    ]
+
+
+def test_lighting(link):
+    """Walk every lighting command and record what the pad actually showed.
+
+    The pad acknowledges all of these whether or not they do anything, so the
+    only thing that can tell them apart is a person looking at it. That makes
+    the tester's time the scarce resource here, which is why this covers all
+    eleven effects in one pass instead of one question per round.
+
+    Answers are free text on purpose. The most useful thing anyone has said
+    about this pad was "it starts red, then the bottom keys gradually shut off
+    and next the top row", and no yes or no would have carried that.
+    """
+    section("Lighting")
+    print("Nothing here is written to flash. Unplug the pad to undo it.")
+    print("Each step is held for %g seconds; --hold changes that." % LIGHT_HOLD)
+    print()
+    print("After each one, say what you saw. A few words is plenty:")
+    print("  off · static red · red, moving left · swept once and stopped")
+    print("Enter on its own means 'nothing happened'. Ctrl-C stops the pass.")
+    print()
+
+    results, seen = {}, {}
+
+    def run(name, packet, question):
+        replies = link.ask(packet, timeout_ms=400)
+        results[name] = [hexs(r) for r in replies]
+        print("  %-26s sent" % name)
+        time.sleep(LIGHT_HOLD)
+        if question is None:
+            return True
+        answer = ask_text("     what did the pad do? (expected: %s)" % question)
+        if answer is None:
+            return False
+        seen[name] = answer or "nothing"
+        return True
+
+    for name, packet, question in lighting_steps():
+        if not run(name, packet, question):
+            break
+    else:
+        print()
+        print("  the per key colours: M1 red, M2 green, M3 blue, M4 white,")
+        print("  M5 to M12 off. Watch whether the right keys light.")
+        for name, packet, question in custom_steps():
+            if not run(name, packet, question):
+                break
+
+    run("off", effect_packet(12), None)
+
+    report["lighting"] = results
+    report["lighting_seen"] = seen
+
+    print()
+    print("This is the summary; please paste it into the issue with the file.")
+    print()
+    print("```")
+    for name, _packet, question in lighting_steps() + custom_steps():
+        if question is not None:
+            print("%-26s %s" % (name + ":", seen.get(name, "(not answered)")))
+    print("```")
+
+
+# Four lit keys at the front and eight dark ones, so the answer says which
+# key got which colour rather than only "they are all different".
+PER_KEY_PATTERN = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255),
+                   (0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0),
+                   (0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)]
+
+
 def per_key_packet():
-    """Twelve visibly different colours, one per key."""
-    palette = [(255, 0, 0), (255, 128, 0), (255, 255, 0), (128, 255, 0),
-               (0, 255, 0), (0, 255, 128), (0, 255, 255), (0, 128, 255),
-               (0, 0, 255), (128, 0, 255), (255, 0, 255), (255, 255, 255)]
+    """A pattern that says which key is which, not just twelve colours.
+
+    "different colour on each key" was the answer the old rainbow got, and it
+    does not say whether the colours landed on the keys they were meant for.
+    Four lit keys at the start and eight dark ones does.
+    """
+    palette = PER_KEY_PATTERN
     packet = bytearray(PAYLOAD_LEN)
     packet[0] = 0x14
     packet[1] = 0x2C
@@ -868,17 +943,18 @@ def custom_activate_packet(brightness=70):
     return bytes(packet)
 
 
-def ask_yes_no(question):
+def ask_text(question):
+    """A free text answer, or None when the tester stops the pass.
+
+    Free text rather than yes or no because the useful answers about lighting
+    are not yes or no: "swept once and stopped" is the sentence that moved
+    #85 forward, and no boolean carries it.
+    """
     try:
-        answer = input("%s [y/n] " % question).strip().lower()
+        return input("%s\n     > " % question).strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return None
-    if answer.startswith("y"):
-        return True
-    if answer.startswith("n"):
-        return False
-    return None
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

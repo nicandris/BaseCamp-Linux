@@ -442,10 +442,9 @@ for name, from_probe, from_driver in pairs:
         print("      probe  %s" % bytes(from_probe)[:14].hex(" "))
         print("      driver %s" % bytes(from_driver)[:14].hex(" "))
 
-palette = [(255, 0, 0), (255, 128, 0), (255, 255, 0), (128, 255, 0),
-           (0, 255, 0), (0, 255, 128), (0, 255, 255), (0, 128, 255),
-           (0, 0, 255), (128, 0, 255), (255, 0, 255), (255, 255, 255)]
-if bytes(probe.per_key_packet()) == bytes(mp.pkt_custom_colors(palette)):
+# The probe sends a diagnostic pattern rather than the twelve colours a person
+# picked, so the two agree on the format and not on the palette.
+if bytes(probe.per_key_packet()) == bytes(mp.pkt_custom_colors(probe.PER_KEY_PATTERN)):
     print("ok    probe per-key colours       matches driver")
 else:
     failures.append("probe per-key colour packet differs from the driver")
