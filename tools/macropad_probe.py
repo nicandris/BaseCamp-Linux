@@ -714,7 +714,8 @@ def test_lighting(link):
     """
     section("Lighting")
     print("Nothing here is written to flash. Unplug the pad to undo it.")
-    print("Watch the pad. You will be asked which steps you saw.\n")
+    print("Watch the pad. You will be asked which steps you saw.")
+    print("Each step is held for %g seconds; --hold changes that.\n" % LIGHT_HOLD)
 
     steps = [
         ("backlight on", bytes([0x12, 0x03]) + bytes(PAYLOAD_LEN - 2), None),
@@ -724,11 +725,23 @@ def test_lighting(link):
         # Wave, the way it was sent before: the ChangeEffect struct.
         ("wave, old form", effect_packet(4),
          "Did 'wave, old form' light the pad?"),
-        # Wave the way Base Camp sends it: ChangeBlockEffect, which is the same
-        # command carrying a struct with a block number, a real direction and a
-        # width of 2.
-        ("wave, block form", block_effect_packet(4, direction=6),
-         "Did 'wave, block form' light the pad?"),
+        # Three shapes of the block form. A single block of width 0 sweeps once
+        # and, on the pad, appeared not to come back; width 2 is what the
+        # service's own builder produces before the SDK overwrites it; and a
+        # two colour wave is a different thing again, four stops spaced along
+        # the strip. One run says which of them repeats.
+        ("wave, one colour width 0", block_effect_packet(4, direction=6),
+         "'wave, one colour width 0': did it keep moving, rather than "
+         "sweeping once and stopping?"),
+        ("wave, one colour width 2",
+         block_effect_packet(4, direction=6, width=2),
+         "'wave, one colour width 2': did it keep moving, rather than "
+         "sweeping once and stopping?"),
+        ("wave, two colours",
+         block_effect_packet(4, direction=6, color=(255, 0, 0),
+                             color2=(0, 0, 255)),
+         "'wave, two colours': did it keep moving, rather than "
+         "sweeping once and stopping?"),
         ("tornado, block form", block_effect_packet(7, direction=10),
          "Did 'tornado, block form' light the pad?"),
     ]
@@ -741,7 +754,7 @@ def test_lighting(link):
         print("  %-20s sent, %d reply/replies" % (name, len(replies)))
         if question:
             questions.append((name, question))
-        time.sleep(1.6)
+        time.sleep(LIGHT_HOLD)
 
     # The custom path, in Base Camp's order and with the step that was missing
     # altogether: activate, then the colours, then the table that says which
@@ -754,7 +767,7 @@ def test_lighting(link):
         replies = link.ask(packet, timeout_ms=400)
         results[name] = [hexs(r) for r in replies]
         print("  %-20s sent, %d reply/replies" % (name, len(replies)))
-        time.sleep(1.6)
+        time.sleep(LIGHT_HOLD)
 
     report["lighting"] = results
     print()
@@ -767,8 +780,11 @@ def test_lighting(link):
         "Did the last three steps light the 12 keys in different colours?")
 
 
+LIGHT_HOLD = 8.0        # seconds to hold each lighting step, see --hold
+
+
 def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
-                        direction=6):
+                        direction=6, width=None, color2=None):
     """Wave or Tornado, as `ChangeBlockEffect` builds it.
 
     Same `14 2C` command as an ordinary effect, different 62 byte struct:
@@ -787,12 +803,21 @@ def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
     # byWidth 0, not 2. getChangeBlockEffect builds it as 2 and the SDK's own
     # wrapper overwrites it with 0 for both of these effects. With 2 the wave
     # lit in the right colour and stood still.
-    packet[8] = 0                         # byWidth
+    # FWBColor is four bytes, a leading `pos` and then r, g, b. An early run
+    # put the colour one byte early, which is why the pad lit white instead of
+    # red. The SDK writes 100 into the first pos and 0xFF into the second.
+    if color2 is not None:
+        # A two colour wave: the pair repeated, spaced along the strip.
+        packet[8] = 2 if width is None else width
+        packet[9] = 4
+        for slot, (pos, rgb) in enumerate(zip((25, 50, 75, 100),
+                                              (color, color2, color, color2))):
+            at = 10 + slot * 4
+            packet[at] = pos
+            packet[at + 1], packet[at + 2], packet[at + 3] = (c & 0xFF for c in rgb)
+        return bytes(packet)
+    packet[8] = 0 if width is None else width
     packet[9] = 1                         # byBlockNum
-    # FWBColor is four bytes, a leading `pos` and then r, g, b. The first run
-    # of this put the colour one byte early, which is why the pad lit white
-    # instead of red. The SDK writes 100 into the first pos and 0xFF into the
-    # second, so this does too.
     packet[10] = 100
     packet[11], packet[12], packet[13] = (c & 0xFF for c in color)
     packet[14] = 0xFF
@@ -869,6 +894,8 @@ def main():
                         help="only talk to this interface number")
     parser.add_argument("--seconds", type=float, default=3.0,
                         help="recording window per key, default 3")
+    parser.add_argument("--hold", type=float, default=None,
+                        help="seconds to hold each lighting step (default 8)")
     parser.add_argument("--lighting", action="store_true",
                         help="also try the lighting commands (not saved to flash)")
     parser.add_argument("--no-keys", action="store_true",
@@ -927,6 +954,8 @@ def main():
         read_firmware(link)
         if not args.no_keys:
             capture_keys(link, args.seconds)
+        if args.hold is not None:
+            globals()["LIGHT_HOLD"] = max(0.0, args.hold)
         if args.lighting:
             test_lighting(link)
     finally:
