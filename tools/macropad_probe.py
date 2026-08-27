@@ -704,29 +704,87 @@ def effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0)):
 
 
 def test_lighting(link):
+    """Walk the lighting commands and ask which of them the pad actually shows.
+
+    The first run of this (issue #85) found that Static works and Wave and the
+    per key colours do not. Reading the Windows software afterwards turned up
+    two candidate reasons, so this now sends the old form and the new one and
+    asks about each. The pad answers every one of these packets either way;
+    only a person looking at it can say which lit up.
+    """
     section("Lighting")
     print("Nothing here is written to flash. Unplug the pad to undo it.")
+    print("Watch the pad. You will be asked which steps you saw.\n")
+
     steps = [
-        ("backlight on", bytes([0x12, 0x03]) + bytes(PAYLOAD_LEN - 2)),
-        ("static red", effect_packet(0, color=(255, 0, 0))),
-        ("static green", effect_packet(0, color=(0, 255, 0))),
-        ("static blue", effect_packet(0, color=(0, 0, 255))),
-        ("wave", effect_packet(4)),
-        ("per-key colours", per_key_packet()),
-        ("custom effect on", custom_activate_packet()),
+        ("backlight on", bytes([0x12, 0x03]) + bytes(PAYLOAD_LEN - 2), None),
+        ("static red", effect_packet(0, color=(255, 0, 0)), None),
+        ("static green", effect_packet(0, color=(0, 255, 0)), None),
+        ("static blue", effect_packet(0, color=(0, 0, 255)), None),
+        # Wave, the way it was sent before: the ChangeEffect struct.
+        ("wave, old form", effect_packet(4),
+         "Did 'wave, old form' light the pad?"),
+        # Wave the way Base Camp sends it: ChangeBlockEffect, which is the same
+        # command carrying a struct with a block number, a real direction and a
+        # width of 2.
+        ("wave, block form", block_effect_packet(4, direction=6),
+         "Did 'wave, block form' light the pad?"),
+        ("tornado, block form", block_effect_packet(7, direction=10),
+         "Did 'tornado, block form' light the pad?"),
     ]
+
     results = {}
-    for name, packet in steps:
+    questions = []
+    for name, packet, question in steps:
         replies = link.ask(packet, timeout_ms=400)
         results[name] = [hexs(r) for r in replies]
-        print("  %-16s sent, %d reply/replies" % (name, len(replies)))
-        time.sleep(1.2)
+        print("  %-20s sent, %d reply/replies" % (name, len(replies)))
+        if question:
+            questions.append((name, question))
+        time.sleep(1.6)
+
+    # The custom path, in Base Camp's order: activate first, then the colours.
+    # The other way round was tried in #85 and stayed dark.
+    print()
+    for name, packet in (("custom effect on", custom_activate_packet()),
+                         ("per-key colours", per_key_packet())):
+        replies = link.ask(packet, timeout_ms=400)
+        results[name] = [hexs(r) for r in replies]
+        print("  %-20s sent, %d reply/replies" % (name, len(replies)))
+        time.sleep(1.6)
+
     report["lighting"] = results
     print()
-    answer = ask_yes_no("Did the lighting actually change while that ran?")
-    report["lighting"]["visible_change"] = answer
-    answer2 = ask_yes_no("Did the last step light the 12 keys in different colours?")
-    report["lighting"]["per_key_worked"] = answer2
+    for name, question in questions:
+        report["lighting"]["saw_" + name.replace(", ", "_").replace(" ", "_")] = \
+            ask_yes_no(question)
+    report["lighting"]["visible_change"] = ask_yes_no(
+        "Did the static colours light the pad?")
+    report["lighting"]["per_key_worked"] = ask_yes_no(
+        "Did the last two steps light the 12 keys in different colours?")
+
+
+def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
+                        direction=6):
+    """Wave or Tornado, as `ChangeBlockEffect` builds it.
+
+    Same `14 2C` command as an ordinary effect, different 62 byte struct:
+    byBlockNum sits after byWidth, so the colours start one byte later, and
+    byDirection and byWidth carry real values instead of 0xFF.
+    """
+    packet = bytearray(PAYLOAD_LEN)
+    packet[0] = 0x14
+    packet[1] = 0x2C
+    packet[2] = int(effect) & 0xFF
+    packet[3] = 0x00                      # byAll
+    packet[4] = max(0, min(100, speed))
+    packet[5] = max(0, min(100, brightness))
+    packet[6] = 0                         # byRandColor: single colour
+    packet[7] = int(direction) & 0xFF
+    packet[8] = 2                         # byWidth
+    packet[9] = 1                         # byBlockNum
+    packet[10], packet[11], packet[12] = (c & 0xFF for c in color)
+    return bytes(packet)
 
 
 def per_key_packet():

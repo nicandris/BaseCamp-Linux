@@ -22,6 +22,15 @@ from devices.macropad import controller as mp   # noqa: E402
 failures = []
 
 
+def verify(name, ok, detail=""):
+    """Plain pass or fail, for what is not a packet prefix."""
+    if ok:
+        print("ok    %-34s %s" % (name, detail))
+    else:
+        failures.append("%s: %s" % (name, detail))
+        print("FAIL  %-34s %s" % (name, detail))
+
+
 def check(name, actual, expected_prefix, length=64):
     """Compare the leading bytes and the total length."""
     problems = []
@@ -233,6 +242,57 @@ if list(mp.KEY_MAP) != displaypad_map:
 else:
     print("ok    key map                   matches the DisplayPad")
 
+# ── Wave and Tornado ride a different struct ─────────────────────────────────
+# Found because @Thargorrr's lighting run in #85 lit up for Static and stayed
+# dark for Wave. Base Camp routes exactly these two through ChangeBlockEffect,
+# which is the same `14 2C` command carrying a different 62 byte struct:
+# byBlockNum sits after byWidth, so the colours move one byte along, and the
+# two fields we were sending as unused carry real values.
+verify("wave is a block effect", mp.uses_block_effect(mp.EFFECT_WAVE) is True)
+verify("tornado is a block effect", mp.uses_block_effect(mp.EFFECT_TORNADO) is True)
+for effect in (mp.EFFECT_STATIC, mp.EFFECT_BREATHING, mp.EFFECT_MATRIX,
+               mp.EFFECT_CUSTOM, mp.EFFECT_OFF):
+    if mp.uses_block_effect(effect):
+        failures.append("effect %d must not use the block command" % effect)
+print("ok    the other effects are not         ChangeEffect as before")
+
+wave = mp.pkt_block_effect(mp.EFFECT_WAVE, brightness=60, speed=60,
+                           color1=(255, 0, 0), direction=0)
+verify("wave: 14 2c and the effect index", wave[:3] == bytes([0x14, 0x2C, 0x04]),
+      wave[:3].hex(" "))
+verify("wave: speed and brightness", (wave[4], wave[5]) == (60, 60))
+verify("wave: direction 0 goes out as 6", wave[7] == 6, wave[7])
+verify("wave: width is 2, not unused", wave[8] == mp.BLOCK_WIDTH, wave[8])
+verify("wave: one block", wave[9] == 1, wave[9])
+verify("wave: the colour sits at 10, not 9",
+       wave[10:13] == b"\xff\x00\x00" and wave[9] != 0xFF, wave[9:13].hex(" "))
+
+for ui, wire in enumerate(mp.WAVE_DIRECTIONS):
+    got = mp.pkt_block_effect(mp.EFFECT_WAVE, direction=ui)[7]
+    if got != wire:
+        failures.append("wave direction %d went out as %d, expected %d" % (ui, got, wire))
+print("ok    wave directions                    %s" % (list(mp.WAVE_DIRECTIONS),))
+for ui, wire in enumerate(mp.TORNADO_DIRECTIONS):
+    got = mp.pkt_block_effect(mp.EFFECT_TORNADO, direction=ui)[7]
+    if got != wire:
+        failures.append("tornado direction %d went out as %d, expected %d" % (ui, got, wire))
+print("ok    tornado directions                 %s" % (list(mp.TORNADO_DIRECTIONS),))
+
+dual = mp.pkt_block_effect(mp.EFFECT_WAVE, color1=(1, 2, 3), color2=(4, 5, 6))
+verify("wave: two colours, back to back",
+      dual[10:16] == bytes([1, 2, 3, 4, 5, 6]) and dual[6] == mp.COLOR_DUAL,
+      dual[6:16].hex(" "))
+rand = mp.pkt_block_effect(mp.EFFECT_WAVE, color_mode=mp.COLOR_RANDOM)
+verify("wave: a random colour carries no block", rand[9] == 0, rand[9])
+
+try:
+    mp.pkt_block_effect(mp.EFFECT_STATIC)
+    failures.append("pkt_block_effect accepted an effect that is not a block one")
+    print("FAIL  block command refuses static")
+except ValueError:
+    print("ok    block command refuses static     the DLL refuses it too")
+
+
 # ── Stored settings must never take the application down ─────────────────────
 # The MacroPad screen is built at startup, not on first visit, so anything
 # that raises while reading its config file stops the window from appearing.
@@ -313,8 +373,16 @@ pairs = [
     ("probe firmware layout", probe.FW_LAYOUT_PACKET, mp.pkt_firmware_layout()),
     ("probe static red", probe.effect_packet(0, brightness=60, color=(255, 0, 0)),
      mp.pkt_effect(mp.EFFECT_STATIC, brightness=60, color1=(255, 0, 0))),
-    ("probe wave", probe.effect_packet(4, brightness=60, speed=60),
+    # The old form of wave, kept on both sides so the probe can send it next to
+    # the new one and a tester can say which of the two lights the pad (#85).
+    ("probe wave, old form", probe.effect_packet(4, brightness=60, speed=60),
      mp.pkt_effect(mp.EFFECT_WAVE, brightness=60, speed=60, color1=(255, 0, 0))),
+    ("probe wave, block form", probe.block_effect_packet(4, direction=6),
+     mp.pkt_block_effect(mp.EFFECT_WAVE, brightness=60, speed=60,
+                         color1=(255, 0, 0), direction=0)),
+    ("probe tornado, block form", probe.block_effect_packet(7, direction=10),
+     mp.pkt_block_effect(mp.EFFECT_TORNADO, brightness=60, speed=60,
+                         color1=(255, 0, 0), direction=0)),
     ("probe custom activate", probe.custom_activate_packet(70),
      mp.pkt_custom_activate(70)),
 ]

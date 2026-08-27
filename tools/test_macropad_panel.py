@@ -77,6 +77,11 @@ class FakePad:
     def set_effect(self, effect, **kwargs):
         self.sent.append(("effect", effect, kwargs))
 
+    def set_effect_auto(self, effect, **kwargs):
+        # Wave and Tornado go out on a different command (#85); the panel
+        # leaves that choice to the controller.
+        self.sent.append(("effect", effect, kwargs))
+
     def set_key_colors(self, colors, brightness=0):
         self.sent.append(("colors", len(colors), brightness))
 
@@ -553,7 +558,7 @@ def checks():
         # A command that raises must be reported, not swallowed, and must not
         # take the thread down with it.
         class RefusingPad(FakePad):
-            def set_effect(self, *_a, **_kw):
+            def set_effect_auto(self, *_a, **_kw):
                 raise OSError("write failed")
 
         refusing = []

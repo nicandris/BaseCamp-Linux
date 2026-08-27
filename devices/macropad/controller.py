@@ -26,8 +26,11 @@ inside a HID helper class that could not be read statically, so
 tools/macropad_probe.py went out to collect it from owners instead. Two dumps
 came back in issue #85, from different distributions and different firmware
 builds, and they agree byte for byte; KEY_MAP below is that measurement.
-Still unverified on hardware: the lighting commands, since neither dump ran
-the probe's opt-in --lighting pass.
+Lighting is measured in part: @Thargorrr ran the probe's --lighting pass in
+#85 and reported that the backlight and all three static colours work, while
+Wave, the per key colours and the custom effect stayed dark. Wave has a fix
+from the SDK below; the custom sequence is closer but probably still
+incomplete. Both want another run to confirm.
 
 Command summary (payload offsets, Report ID not counted):
 
@@ -41,6 +44,7 @@ Command summary (payload offsets, Report ID not counted):
   14 20  [2:4]=src [4:6]=target      remap a key
   14 21  [2:4]=src [4]=key [5]=mods  assign a shortcut
   14 2C  [2:64]=EffData              lighting effect (62 byte struct)
+  14 2C  [2:64]=BlockData            Wave and Tornado, a different struct
   14 2C 00 01 [4]=chunk [5]=4B       per-key static colours at offset 7
 
 Acknowledgement: response[0] == 0xFF and response[1] == 0xAA, except for
@@ -252,6 +256,79 @@ def pkt_effect(effect, brightness=DEFAULT_BRIGHTNESS, speed=DEFAULT_SPEED,
             p[12], p[13], p[14] = _rgb(color2)
     if background is not None:
         p[18], p[19], p[20] = _rgb(background)
+    return bytes(p)
+
+
+# ── Wave and Tornado: a different struct behind the same command ─────────────
+#
+# Measured by @Thargorrr in #85: Static lit up, Wave stayed dark. The reason is
+# in the Windows software rather than in the pad. Base Camp routes exactly two
+# effects, Colorwave and Tornado, through `ChangeBlockEffect` instead of
+# `ChangeEffect`:
+#
+#     (EffMenuIndex != Colorwave && EffMenuIndex != Tornado)
+#         ? ChangeEffect(...)       // EffData
+#         : ChangeBlockEffect(...)  // BlockData
+#
+# Both go out as `14 2C` with 62 bytes at payload offset 2, so the command is
+# the same; the struct is not. BlockData inserts byBlockNum after byWidth,
+# which pushes the colours one byte along, and carries two colours instead of
+# three. And the two fields we were sending as "unused" are real here: the
+# SDK sets byWidth to 2 and a genuine direction. The wrapper in the DLL also
+# refuses any effect index other than 4, 5 and 7.
+#
+#   [2] byEffectIndex   [3] byAll       [4] bySpeed    [5] byLightness
+#   [6] byRandColor     [7] byDirection [8] byWidth    [9] byBlockNum
+#   [10:16] colorLv[2]
+#
+# Direction is not the plain 0 to 3 the UI shows either. Base Camp maps it:
+BLOCK_EFFECTS = (EFFECT_WAVE, EFFECT_TORNADO)
+
+WAVE_DIRECTIONS    = (6, 2, 4, 0)     # UI 0..3, from getChangeBlockEffect()
+TORNADO_DIRECTIONS = (10, 9)          # UI 0..1
+BLOCK_WIDTH = 2
+
+
+def uses_block_effect(effect):
+    """True for the two effects that go through the block command."""
+    return int(effect) in BLOCK_EFFECTS
+
+
+def pkt_block_effect(effect, brightness=DEFAULT_BRIGHTNESS, speed=DEFAULT_SPEED,
+                     color1=(255, 255, 255), color2=None, color_mode=None,
+                     direction=0, all_keys=0):
+    """Wave or Tornado: `14 2C` followed by the 62 byte BlockData struct.
+
+    Derived from MacroPadSDK.dll and Base Camp's own call site, not measured on
+    hardware yet: the run that found the problem could only show that the old
+    packet did nothing.
+    """
+    effect = int(effect)
+    if effect not in BLOCK_EFFECTS:
+        raise ValueError("effect %d does not use the block command" % effect)
+    p = _pkt()
+    p[0] = 0x14
+    p[1] = 0x2C
+    p[2] = effect & 0xFF
+    p[3] = int(all_keys) & 0xFF
+    p[4] = _clamp(speed, 0, 100)
+    p[5] = _clamp(brightness, 0, 100)
+
+    if color_mode is None:
+        color_mode = COLOR_DUAL if color2 is not None else COLOR_SINGLE
+    p[6] = int(color_mode) & 0xFF
+
+    table = WAVE_DIRECTIONS if effect == EFFECT_WAVE else TORNADO_DIRECTIONS
+    p[7] = table[int(direction) % len(table)]
+    p[8] = BLOCK_WIDTH
+    # A random colour carries no block, which is what the SDK sets alongside
+    # byRandColor = 2.
+    p[9] = 0 if color_mode == COLOR_RANDOM else 1
+
+    if color_mode != COLOR_RANDOM:
+        p[10], p[11], p[12] = _rgb(color1)
+        if color2 is not None:
+            p[13], p[14], p[15] = _rgb(color2)
     return bytes(p)
 
 
@@ -480,11 +557,27 @@ class MacroPad:
         return self.command(pkt_effect(effect, **kwargs))
 
     def set_key_colors(self, colors, brightness=DEFAULT_BRIGHTNESS):
-        """Paint the 12 keys individually: upload the colours, then switch the
-        firmware to the custom effect so they become visible."""
-        response = self.command(pkt_custom_colors(colors))
+        """Paint the 12 keys individually.
+
+        The order is Base Camp's, and it is the other way round from what
+        looks natural: switch to the custom effect first, then send the
+        colours. @Thargorrr's run in #85 sent the colours first and then
+        activated, both packets were accepted, and the pad stayed dark.
+
+        Still missing from this sequence, and the reason to expect it may
+        not be enough on its own: Base Camp follows the colours with
+        SaveFlash, reads the customize table back with GetCustomizeTable,
+        sends a ChangeEffect, and writes the table again with
+        SetCustomizeTable. The wire format of that last one is not worked out.
+        """
         self.command(pkt_custom_activate(brightness))
-        return response
+        return self.command(pkt_custom_colors(colors))
+
+    def set_effect_auto(self, effect, **kwargs):
+        """Send an effect over whichever of the two commands it belongs to."""
+        if uses_block_effect(effect):
+            return self.command(pkt_block_effect(effect, **kwargs))
+        return self.command(pkt_effect(effect, **kwargs))
 
     def remap_key(self, source, target):
         return self.command(pkt_remap_key(source, target))

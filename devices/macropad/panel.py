@@ -47,19 +47,26 @@ _ACTION_TYPES = ["none", "shell", "url", "folder", "app", "obs", "macro",
 # Which controls an effect actually uses. Sending a colour to an effect that
 # ignores it is harmless, but showing a colour button that changes nothing is
 # not, so the panel hides what the effect does not read.
-#   effect id: (speed, colour 1, colour 2)
+#   effect id: (speed, colour 1, colour 2, direction)
 _EFFECT_CONTROLS = {
-    mp.EFFECT_STATIC:     (False, True,  False),
-    mp.EFFECT_BREATHING:  (True,  True,  True),
-    mp.EFFECT_WAVE:       (True,  True,  False),
-    mp.EFFECT_TORNADO:    (True,  True,  False),
-    mp.EFFECT_MATRIX:     (True,  True,  True),
-    mp.EFFECT_YETI:       (True,  True,  True),
-    mp.EFFECT_REACTIVE_A: (True,  True,  True),
-    mp.EFFECT_REACTIVE_B: (True,  True,  True),
-    mp.EFFECT_REACTIVE_C: (True,  True,  True),
-    mp.EFFECT_CUSTOM:     (False, False, False),
-    mp.EFFECT_OFF:        (False, False, False),
+    mp.EFFECT_STATIC:     (False, True,  False, False),
+    mp.EFFECT_BREATHING:  (True,  True,  True,  False),
+    mp.EFFECT_WAVE:       (True,  True,  False, True),
+    mp.EFFECT_TORNADO:    (True,  True,  False, True),
+    mp.EFFECT_MATRIX:     (True,  True,  True,  False),
+    mp.EFFECT_YETI:       (True,  True,  True,  False),
+    mp.EFFECT_REACTIVE_A: (True,  True,  True,  False),
+    mp.EFFECT_REACTIVE_B: (True,  True,  True,  False),
+    mp.EFFECT_REACTIVE_C: (True,  True,  True,  False),
+    mp.EFFECT_CUSTOM:     (False, False, False, False),
+    mp.EFFECT_OFF:        (False, False, False, False),
+}
+
+# Wave turns four ways, Tornado two. The wire values behind these are not
+# 0 to 3; the controller maps them (#85).
+_DIRECTION_KEYS = {
+    mp.EFFECT_WAVE:    ("mp_dir_right", "mp_dir_left", "mp_dir_down", "mp_dir_up"),
+    mp.EFFECT_TORNADO: ("mp_dir_cw", "mp_dir_ccw"),
 }
 
 # The tile colour while a key is being pressed. BG2 is darker than the tile,
@@ -546,6 +553,19 @@ class MacroPadPanel(ctk.CTkFrame):
             "rgb_speed_label", int(self._rgb["speed"]),
             lambda v: self._set_rgb("speed", v))
 
+        line = ctk.CTkFrame(parent, fg_color="transparent")
+        self._reg(ctk.CTkLabel(line, text="", text_color=FG2,
+                               font=(UI.FONT_FAMILY, 11), width=110,
+                               anchor="w"), "rgb_direction_label").pack(side="left")
+        self._dir_var = tk.StringVar()
+        self._dir_menu = ctk.CTkOptionMenu(
+            line, variable=self._dir_var, values=[""],
+            command=lambda _v: self._on_direction_change(),
+            fg_color=BG3, button_color=BG3, button_hover_color=BG2,
+            text_color=FG, font=(UI.FONT_FAMILY, 11), width=180, height=32)
+        self._dir_menu.pack(side="left")
+        self._dir_row = line
+
         self._color_rows = {}
         for slot, key in ((1, "rgb_color1_label"), (2, "rgb_color2_label")):
             line = ctk.CTkFrame(parent, fg_color="transparent")
@@ -584,6 +604,7 @@ class MacroPadPanel(ctk.CTkFrame):
         self._rgb_status.pack(fill="x", padx=10, pady=(2, 10))
 
         self._refresh_effect_menu()
+        self._refresh_direction_menu(self._current_effect())
         self._update_rgb_controls()
 
     def _refresh_effect_menu(self):
@@ -616,9 +637,13 @@ class MacroPadPanel(ctk.CTkFrame):
         back underneath the Apply button instead of where it belongs.
         """
         effect = self._current_effect()
-        has_speed, has_c1, has_c2 = _EFFECT_CONTROLS.get(effect, (True, True, True))
+        has_speed, has_c1, has_c2, has_dir = _EFFECT_CONTROLS.get(
+            effect, (True, True, True, False))
+        if has_dir:
+            self._refresh_direction_menu(effect)
         rows = ((self._bri_row, True),
                 (self._speed_row, has_speed),
+                (self._dir_row, has_dir),
                 (self._color_rows[1][0], has_c1),
                 (self._color_rows[2][0], has_c2))
         for widget, _visible in rows:
@@ -634,6 +659,24 @@ class MacroPadPanel(ctk.CTkFrame):
             self._custom_hint.pack(fill="x", padx=10, pady=(6, 0))
         self._rgb_buttons.pack(fill="x", padx=10, pady=(10, 4))
         self._rgb_status.pack(fill="x", padx=10, pady=(2, 10))
+
+    def _refresh_direction_menu(self, effect):
+        """Fill the direction menu for the effect that is showing."""
+        keys = _DIRECTION_KEYS.get(effect, ())
+        self._dir_labels = [self.T(k) for k in keys]
+        self._dir_menu.configure(values=self._dir_labels or [""])
+        index = int(self._rgb.get("direction", 0))
+        if index >= len(self._dir_labels):
+            index = 0
+        if self._dir_labels:
+            self._dir_var.set(self._dir_labels[index])
+
+    def _on_direction_change(self):
+        try:
+            self._rgb["direction"] = self._dir_labels.index(self._dir_var.get())
+        except (ValueError, AttributeError):
+            self._rgb["direction"] = 0
+        self._store_rgb()
 
     def _set_rgb(self, key, value):
         self._rgb[key] = value
@@ -679,12 +722,15 @@ class MacroPadPanel(ctk.CTkFrame):
         if effect == mp.EFFECT_CUSTOM:
             self._apply_key_colors()
             return
-        _has_speed, has_c1, has_c2 = _EFFECT_CONTROLS.get(effect, (True, True, True))
+        _has_speed, has_c1, has_c2, has_dir = _EFFECT_CONTROLS.get(
+            effect, (True, True, True, False))
         kwargs = {"brightness": brightness, "speed": int(self._rgb["speed"])}
         if has_c1:
             kwargs["color1"] = tuple(self._rgb["color1"])
         if has_c2:
             kwargs["color2"] = tuple(self._rgb["color2"])
+        if has_dir:
+            kwargs["direction"] = int(self._rgb.get("direction", 0))
         self._set_rgb_status(self.T("rgb_applying"))
         self._submit("effect", effect=effect, kwargs=kwargs)
 
@@ -830,7 +876,9 @@ class MacroPadPanel(ctk.CTkFrame):
         kind = job.get("kind")
         try:
             if kind == "effect":
-                pad.set_effect(job["effect"], **job["kwargs"])
+                # Wave and Tornado ride a different command with a different
+                # struct; the controller picks (#85).
+                pad.set_effect_auto(job["effect"], **job["kwargs"])
                 self._post_status(self.T("rgb_applied"), GRN)
             elif kind == "colors":
                 pad.set_key_colors(job["colors"], brightness=job["brightness"])
