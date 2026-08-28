@@ -6,7 +6,8 @@ Run: python3 tools/test_volume_parse.py
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from shared.volume import parse_wpctl_volume as parse, is_volume_event
+from shared.volume import (parse_wpctl_volume as parse, is_volume_event,
+                           parse_pactl_volume, parse_pactl_mute)
 
 
 def test():
@@ -35,6 +36,23 @@ def test():
     assert not is_volume_event("Event 'remove' on client #12")
     assert not is_volume_event("")
     assert not is_volume_event(None)
+    # pactl prints one reading per channel; the first percentage is the level.
+    assert parse_pactl_volume(
+        "Volume: front-left: 32768 /  50% / -18.06 dB,   front-right: 32768 /  50% / -18.06 dB") == 50
+    assert parse_pactl_volume("Volume: mono: 0 /   0% / -inf dB") == 0
+    assert parse_pactl_volume("Volume: mono: 65536 / 100% / 0.00 dB") == 100
+    assert parse_pactl_volume("Volume: mono: 98304 / 150% / 7.06 dB") == 100   # clamps
+    assert parse_pactl_volume("Sink not found") is None
+    assert parse_pactl_volume("Volume: mono: no percentage here") is None
+    assert parse_pactl_volume("") is None
+    assert parse_pactl_volume(None) is None
+
+    assert parse_pactl_mute("Mute: yes") is True
+    assert parse_pactl_mute("Mute: no") is False
+    assert parse_pactl_mute("Mute:") is None
+    assert parse_pactl_mute("Sink not found") is None
+    assert parse_pactl_mute(None) is None
+
     print("volume parse ok")
 
 

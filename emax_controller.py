@@ -12,6 +12,8 @@ import threading
 import psutil
 import pwd as _pwd
 from shared.image_utils import image_to_rgb565
+from shared.volume import (system_volume as _system_volume,
+                           start_watch as _start_volume_watch)
 
 VID = 0x3282
 PID = 0x0001
@@ -94,9 +96,6 @@ def _read(dev, timeout=1000):
 # over `11 83 00 00 <level>`. The firmware does not track the system level on
 # its own — its wheel is an ordinary HID consumer control — so without this the
 # readout drifts from the real volume and ignores any change made elsewhere.
-
-from shared.volume import (system_volume as _system_volume,
-                           start_watch as _start_volume_watch)
 
 VOLUME_CMD = 0x83
 

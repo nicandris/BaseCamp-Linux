@@ -23,6 +23,7 @@ from shared.config import (
     _compute_lib_hash, _compute_main_lib_hash,
     macro_names,
 )
+from shared.volume import system_volume, start_watch
 from shared.ui_helpers import (CardColumns,
     BG, BG2, BG3, FG, FG2, BLUE, YLW, GRN, RED, BORDER,
     AccordionSection, LibraryPickerDialog, MultiUploadDialog, CustomRGBWindow,
@@ -275,8 +276,9 @@ class EverestMaxPanel(ctk.CTkFrame):
                 mbs = ((io.bytes_sent + io.bytes_recv) - self._net_last[1]) / dt / 1e6
             self._net_last = (now, io.bytes_sent + io.bytes_recv)
             # Volume is the one meter that is not psutil: it is what the
-            # loop pushes to the wheel display, so show the same number.
-            from shared.volume import system_volume
+            # loop pushes to the wheel display, so show the same number. The
+            # watcher started in refresh() makes this a variable read; without
+            # it this would fork a mixer command on the Tk thread every tick.
             vol = system_volume()
             for key, value, shown in (("cpu", cpu, f"{cpu:.0f}%"),
                                       ("ram", ram, f"{ram:.0f}%"),
@@ -293,6 +295,7 @@ class EverestMaxPanel(ctk.CTkFrame):
 
     def refresh(self):
         self._sync_card_hints()
+        start_watch()          # follow the mixer while this screen is on show
         if getattr(self, "_meter_after", None) is None:
             self._tick_meters()
 

@@ -4,8 +4,15 @@ Two callers need it: the monitor loop in emax_controller, which pushes the
 level to the keyboard's wheel display over `11 83`, and the Everest panel,
 which mirrors what the keyboard is being sent.
 
-`@DEFAULT_AUDIO_SINK@` re-resolves on every read, so switching output device is
-followed with no extra work.
+The default sink is re-resolved on every read, so switching output device is
+followed with no extra work. `wpctl` is used where WirePlumber runs and `pactl`
+otherwise, because a PulseAudio system without WirePlumber has no `wpctl` at
+all and would otherwise report nothing at all.
+
+Both are run with the bundle's library-path injection stripped, the house rule
+for anything we launch (#49), and with `LC_ALL=C`: `pactl` translates its
+output, so on a German desktop `pactl subscribe` says `Ereignis` where the
+filter looks for `Event` and every change would be missed.
 
 Why a watcher and not a poll: the loop pushes the level several times a second.
 Any staleness in the cached value is pushed *over* the level the firmware just
@@ -15,17 +22,28 @@ merely frequent. If it is unavailable the code falls back to a rate-limited
 poll, which still works — it just flickers on wheel turns.
 """
 import ctypes
+import re
 import signal
 import subprocess
 import threading
 import time
 
+from shared.macros import clean_child_env
+
 POLL_INTERVAL = 0.5          # fallback only, when the watcher is not running
+
+
+def _child_env():
+    """Environment for the mixer commands: no bundle paths, no translation."""
+    env = clean_child_env()
+    env["LC_ALL"] = "C"
+    return env
 
 _lock = threading.Lock()
 _level = None                # last known level, from watcher or poll
 _last_poll = 0.0
 _watcher = None
+_reader = None               # the mixer command that answered last
 
 
 def parse_wpctl_volume(text):
@@ -56,13 +74,72 @@ def is_volume_event(line):
     return " on sink " in line or " on server " in line
 
 
-def _read():
-    try:
-        out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
-                             capture_output=True, text=True, timeout=1).stdout
-    except Exception:
+def parse_pactl_volume(text):
+    """Level 0-100 from `pactl get-sink-volume` output, None if unrecognised.
+
+    pactl prints one reading per channel, `front-left: 32768 /  50% / -18.06
+    dB, front-right: ...`. The channels of a sink move together for our
+    purposes, so the first percentage is the level.
+    """
+    if not text or not text.startswith("Volume:"):
         return None
-    return parse_wpctl_volume(out.strip())
+    found = re.search(r"(\d+)%", text)
+    if not found:
+        return None
+    return max(0, min(100, int(found.group(1))))
+
+
+def parse_pactl_mute(text):
+    """True/False from `pactl get-sink-mute` output, None if unrecognised."""
+    if not text or not text.startswith("Mute:"):
+        return None
+    parts = text.split()
+    if len(parts) < 2:
+        return None
+    return parts[1] == "yes"
+
+
+def _run(cmd):
+    """stdout of a mixer command, or None if it is missing or fails."""
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=1,
+                              env=_child_env())
+    except Exception:                     # not installed, or it hung
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def _read_wpctl():
+    return parse_wpctl_volume(_run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"]))
+
+
+def _read_pactl():
+    """The PulseAudio path. Mute is a second call here; wpctl reports it inline."""
+    level = parse_pactl_volume(_run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"]))
+    if level is None:
+        return None
+    return 0 if parse_pactl_mute(_run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"])) else level
+
+
+def _read():
+    """Ask whichever mixer this system actually has.
+
+    The working one is remembered so the other is not forked on every read, and
+    forgotten again the moment it stops answering, so a system that gains or
+    loses WirePlumber is not stuck with the wrong choice.
+    """
+    global _reader
+    if _reader is not None:
+        value = _reader()
+        if value is not None:
+            return value
+        _reader = None
+    for reader in (_read_wpctl, _read_pactl):
+        value = reader()
+        if value is not None:
+            _reader = reader
+            return value
+    return None
 
 
 try:
@@ -95,7 +172,7 @@ def _watch_loop():
     try:
         proc = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True,
-                                preexec_fn=_die_with_parent)
+                                env=_child_env(), preexec_fn=_die_with_parent)
     except Exception:
         return
     try:
@@ -115,16 +192,24 @@ def _watch_loop():
 
 
 def start_watch():
-    """Begin following volume changes as they happen. Safe to call twice."""
+    """Begin following volume changes as they happen.
+
+    Safe to call from anywhere, any number of times: the panel calls it when
+    the screen is shown and the monitor loop calls it when it starts, and both
+    may be in the same process.
+    """
     global _watcher, _level
-    if _watcher is not None and _watcher.is_alive():
-        return
-    seed = _read()                        # outside the lock: this forks a process
-    if seed is not None:
-        with _lock:
-            _level = seed
-    _watcher = threading.Thread(target=_watch_loop, daemon=True)
-    _watcher.start()
+    seed = _read()                        # before the lock: this forks a process
+    with _lock:
+        if seed is not None:
+            _level = seed                 # so the first push is a real level
+        if _watcher is not None and _watcher.is_alive():
+            return
+        # Started while holding the lock: a thread that exists but has not run
+        # yet reports itself as not alive, so releasing first would let a second
+        # caller start another one.
+        _watcher = threading.Thread(target=_watch_loop, daemon=True)
+        _watcher.start()
 
 
 def system_volume():
