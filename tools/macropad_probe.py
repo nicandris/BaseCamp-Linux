@@ -689,12 +689,38 @@ def analyse_capture(baseline, per_key):
 
 # ── optional lighting check ───────────────────────────────────────────────────
 
+# The pad does not take a 0 to 100 speed. Both SDK wrappers run the value
+# through a table first, and the firmware wants a small number that runs
+# downwards: a faster setting is a smaller value. Sending 60 raw is why
+# breathing crawled once and then stood still (#85).
+SPEED_STEPS = (12, 37, 62, 87)
+SPEED_TABLE = {
+    4: (10, 9, 8, 7, 6), 7: (10, 9, 8, 7, 6),          # wave, tornado
+    1: (5, 4, 3, 1, 0), 3: (5, 4, 3, 1, 0),            # breathing, reactive A
+    5: (5, 4, 3, 1, 0), 11: (5, 4, 3, 1, 0),           # reactive B, C
+    9: (20, 15, 10, 5, 0),                             # matrix
+    6: (10, 7, 5, 3, 0),                               # yeti
+}
+
+
+def firmware_speed(effect, ui_speed):
+    """The number the pad wants, from the 0 to 100 a person sets."""
+    table = SPEED_TABLE.get(int(effect))
+    value = max(0, min(100, int(ui_speed)))
+    if table is None:
+        return value
+    for index, bound in enumerate(SPEED_STEPS):
+        if value <= bound:
+            return table[index]
+    return table[-1]
+
+
 def effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0)):
     packet = bytearray(PAYLOAD_LEN)
     packet[0] = 0x14
     packet[1] = 0x2C
     packet[2] = effect
-    packet[4] = 0xFF if effect in (0, 12) else speed
+    packet[4] = 0xFF if effect in (0, 12) else firmware_speed(effect, speed)
     packet[5] = brightness
     packet[6] = 0x00
     packet[7] = 0xFF
@@ -723,7 +749,7 @@ def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
     packet[1] = 0x2C
     packet[2] = int(effect) & 0xFF
     packet[3] = 0x00                      # byAll
-    packet[4] = max(0, min(100, speed))
+    packet[4] = firmware_speed(effect, speed)
     packet[5] = max(0, min(100, brightness))
     packet[6] = 0                         # byRandColor: single colour
     packet[7] = int(direction) & 0xFF
@@ -744,6 +770,27 @@ def block_effect_packet(effect, brightness=60, speed=60, color=(255, 0, 0),
     packet[10] = 100
     packet[11], packet[12], packet[13] = (c & 0xFF for c in color)
     packet[14] = 0xFF
+    return bytes(packet)
+
+
+def reactive_b_packet(brightness=60, speed=60, color=(255, 0, 0), color2=None):
+    """Reactive B: the block command, no direction, both colour positions
+    marked unused, which is what the SDK wrapper sets for effect 5."""
+    packet = bytearray(PAYLOAD_LEN)
+    packet[0] = 0x14
+    packet[1] = 0x2C
+    packet[2] = 5
+    packet[4] = firmware_speed(5, speed)
+    packet[5] = max(0, min(100, brightness))
+    packet[6] = 16 if color2 is not None else 0
+    packet[7] = 0xFF                      # no direction
+    packet[8] = 2                         # byWidth
+    packet[9] = 1                         # byBlockNum
+    packet[10] = 0xFF
+    packet[11], packet[12], packet[13] = (c & 0xFF for c in color)
+    packet[14] = 0xFF
+    if color2 is not None:
+        packet[15], packet[16], packet[17] = (c & 0xFF for c in color2)
     return bytes(packet)
 
 
@@ -810,7 +857,10 @@ def lighting_steps():
         # These three only light where a key is pressed.
         ("reactive A", effect_packet2(3, color=red, color2=blue),
          "reactive A, press some keys now"),
-        ("reactive B", effect_packet2(5, color=red, color2=blue),
+        # Reactive B is a block effect, not an ordinary one: the DLL accepts
+        # 4, 5 and 7 on the block command and 0, 1, 3, 6, 9, 11, 12 on the
+        # other. Sending it as an ordinary effect is why it did nothing.
+        ("reactive B", reactive_b_packet(color=red, color2=blue),
          "reactive B, press some keys now"),
         ("reactive C", effect_packet2(11, color=red, color2=blue),
          "reactive C, press some keys now"),
