@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [3.1.2] - 2026-08-29
 
 - **The interface no longer starts in German on a machine that is not (#92).** Reported by @Eirikur on Linux Mint, who could not find how to switch it and had grepped the code looking. The default was a hardcoded `"de"`, so a first start with no language chosen came up German wherever it was, and the way out of that is a setting labelled in German. It follows the system locale now, in gettext's order (LANGUAGE, LC_ALL, LC_MESSAGES, LANG), and falls back to English rather than German for a locale there is no translation for. Anyone who has picked a language keeps it: that choice is stored and still wins.
 
