@@ -123,6 +123,47 @@ UNUSED = 0xFF
 # Lighting defaults straight out of the Base Camp data model (Lighting.cs),
 # which also tells us the units: both are percentages, 0-100.
 DEFAULT_SPEED = 60
+
+# ── Speed is translated, not passed through ──────────────────────────────────
+#
+# `getUISpeed()` in the service is a one line pass-through, which is what made
+# this look settled. It is not the whole story: both SDK wrappers run the value
+# through a table before the packet goes out, and the firmware wants a small
+# number, not 0 to 100. @Thargorrr's fourth run in #85 is what exposed it,
+# "breathing from off to red very slowly, then stays static red", which is a
+# 60 arriving where the firmware expects a 3.
+#
+# The slider has five positions. The thresholds are the same for every effect
+# and the values behind them are not, and they run downwards: a higher setting
+# is a smaller number.
+_SPEED_STEPS = (12, 37, 62, 87)        # upper bound of each of the first four
+
+SPEED_TABLE = {
+    EFFECT_WAVE:       (10, 9, 8, 7, 6),
+    EFFECT_TORNADO:    (10, 9, 8, 7, 6),
+    EFFECT_BREATHING:  (5, 4, 3, 1, 0),
+    EFFECT_REACTIVE_A: (5, 4, 3, 1, 0),
+    EFFECT_REACTIVE_B: (5, 4, 3, 1, 0),
+    EFFECT_REACTIVE_C: (5, 4, 3, 1, 0),
+    EFFECT_MATRIX:     (20, 15, 10, 5, 0),
+    EFFECT_YETI:       (10, 7, 5, 3, 0),
+}
+
+
+def firmware_speed(effect, ui_speed):
+    """The number the pad wants, from the 0 to 100 a person set.
+
+    Effects with no entry keep the value they were given; the SDK's table
+    leaves those alone too.
+    """
+    table = SPEED_TABLE.get(int(effect))
+    if table is None:
+        return _clamp(ui_speed, 0, 100)
+    value = _clamp(ui_speed, 0, 100)
+    for index, bound in enumerate(_SPEED_STEPS):
+        if value <= bound:
+            return table[index]
+    return table[-1]
 DEFAULT_BRIGHTNESS = 75
 
 
@@ -242,7 +283,7 @@ def pkt_effect(effect, brightness=DEFAULT_BRIGHTNESS, speed=DEFAULT_SPEED,
     if effect in (EFFECT_STATIC, EFFECT_OFF):
         p[4] = UNUSED
     else:
-        p[4] = _clamp(speed, 0, 100)
+        p[4] = firmware_speed(effect, speed)
     p[5] = _clamp(brightness, 0, 100)
 
     if color_mode is None:
@@ -299,7 +340,11 @@ BLOCK_POS_FIRST  = 100
 BLOCK_POS_SECOND = 0xFF
 #
 # Direction is not the plain 0 to 3 the UI shows either. Base Camp maps it:
-BLOCK_EFFECTS = (EFFECT_WAVE, EFFECT_TORNADO)
+# Reactive B goes with them: ChangeBlockEffect accepts exactly 4, 5 and 7,
+# and ChangeEffect accepts 0, 1, 3, 6, 9, 11 and 12. Reactive B is in the first
+# list and not the second, and sending it as an ordinary effect is why it was
+# the one thing on the pad that did nothing at all (#85).
+BLOCK_EFFECTS = (EFFECT_WAVE, EFFECT_REACTIVE_B, EFFECT_TORNADO)
 
 WAVE_DIRECTIONS    = (6, 2, 4, 0)     # UI 0..3, from getChangeBlockEffect()
 TORNADO_DIRECTIONS = (10, 9)          # UI 0..1
@@ -341,12 +386,27 @@ def pkt_block_effect(effect, brightness=DEFAULT_BRIGHTNESS, speed=DEFAULT_SPEED,
     p[1] = 0x2C
     p[2] = effect & 0xFF
     p[3] = int(all_keys) & 0xFF
-    p[4] = _clamp(speed, 0, 100)
+    p[4] = firmware_speed(effect, speed)
     p[5] = _clamp(brightness, 0, 100)
 
     if color_mode is None:
         color_mode = COLOR_DUAL if color2 is not None else COLOR_SINGLE
     p[6] = int(color_mode) & 0xFF
+
+    if effect == EFFECT_REACTIVE_B:
+        # It rides the block command but has no direction, and the wrapper
+        # marks both colour positions unused.
+        p[7] = UNUSED
+        p[8] = BLOCK_WIDTH_SPREAD
+        p[9] = 0 if color_mode == COLOR_RANDOM else 1
+        p[6] = COLOR_RANDOM if color_mode == COLOR_RANDOM else int(color_mode) & 0xFF
+        if color_mode != COLOR_RANDOM:
+            p[10] = UNUSED
+            p[11], p[12], p[13] = _rgb(color1)
+            p[14] = UNUSED
+            if color2 is not None:
+                p[15], p[16], p[17] = _rgb(color2)
+        return bytes(p)
 
     table = WAVE_DIRECTIONS if effect == EFFECT_WAVE else TORNADO_DIRECTIONS
     p[7] = table[int(direction) % len(table)]

@@ -92,11 +92,13 @@ check("static effect", static,
       bytes([0x14, 0x2C, 0x00, 0x00, 0xFF, 75, 0x00, 0xFF, 0xFF,
              0x00, 0x44, 0xFF]))
 
-# Wave: a real speed value, dual colour raises byRandColor to 16.
+# Wave through the ordinary command. Kept because the probe still sends this
+# form as the control that does nothing, and because the speed on the wire is
+# the translated 8 rather than the 60 that was set.
 wave = mp.pkt_effect(mp.EFFECT_WAVE, brightness=50, speed=60,
                      color1=(1, 2, 3), color2=(4, 5, 6))
-check("wave dual colour", wave,
-      bytes([0x14, 0x2C, 0x04, 0x00, 60, 50, 0x10, 0xFF, 0xFF,
+check("wave dual colour, old form", wave,
+      bytes([0x14, 0x2C, 0x04, 0x00, 8, 50, 0x10, 0xFF, 0xFF,
              1, 2, 3, 4, 5, 6]))
 
 # Off carries no colour at all.
@@ -260,7 +262,9 @@ wave = mp.pkt_block_effect(mp.EFFECT_WAVE, brightness=60, speed=60,
                            color1=(255, 0, 0), direction=0)
 verify("wave: 14 2c and the effect index", wave[:3] == bytes([0x14, 0x2C, 0x04]),
       wave[:3].hex(" "))
-verify("wave: speed and brightness", (wave[4], wave[5]) == (60, 60))
+verify("wave: brightness raw, speed translated",
+       (wave[4], wave[5]) == (mp.firmware_speed(mp.EFFECT_WAVE, 60), 60),
+       (wave[4], wave[5]))
 verify("wave: direction 0 goes out as 6", wave[7] == 6, wave[7])
 # byWidth 0, not 2: the builder in the service says 2 and the SDK's wrapper
 # overwrites it. @Thargorrr's third run is what forced this out, wave lit in
@@ -319,6 +323,54 @@ try:
     print("FAIL  block command refuses static")
 except ValueError:
     print("ok    block command refuses static     the DLL refuses it too")
+
+
+# ── Speed is translated, not passed through ─────────────────────────────────
+# @Thargorrr's fourth run: "breathing from off to red very slowly, then stays
+# static red". Both SDK wrappers run the value through a table before sending,
+# and the firmware wants a small number that runs downwards.
+for effect, expected in ((mp.EFFECT_WAVE, [10, 9, 8, 7, 6]),
+                         (mp.EFFECT_TORNADO, [10, 9, 8, 7, 6]),
+                         (mp.EFFECT_BREATHING, [5, 4, 3, 1, 0]),
+                         (mp.EFFECT_REACTIVE_A, [5, 4, 3, 1, 0]),
+                         (mp.EFFECT_REACTIVE_B, [5, 4, 3, 1, 0]),
+                         (mp.EFFECT_REACTIVE_C, [5, 4, 3, 1, 0]),
+                         (mp.EFFECT_MATRIX, [20, 15, 10, 5, 0]),
+                         (mp.EFFECT_YETI, [10, 7, 5, 3, 0])):
+    got = [mp.firmware_speed(effect, s) for s in (0, 25, 50, 75, 100)]
+    if got != expected:
+        failures.append("speed for effect %d: %s, expected %s"
+                        % (effect, got, expected))
+print("ok    speed table                        eight effects, five steps each")
+
+verify("the thresholds are on the boundary",
+       (mp.firmware_speed(mp.EFFECT_WAVE, 12), mp.firmware_speed(mp.EFFECT_WAVE, 13))
+       == (10, 9), "12 and 13")
+verify("an effect with no entry passes through",
+       mp.firmware_speed(mp.EFFECT_STATIC, 42) == 42)
+verify("breathing goes out translated, not raw",
+       mp.pkt_effect(mp.EFFECT_BREATHING, speed=60)[4] == 3,
+       mp.pkt_effect(mp.EFFECT_BREATHING, speed=60)[4])
+verify("and so does a block effect",
+       mp.pkt_block_effect(mp.EFFECT_WAVE, speed=60)[4] == 8,
+       mp.pkt_block_effect(mp.EFFECT_WAVE, speed=60)[4])
+
+# ── Reactive B is a block effect ─────────────────────────────────────────────
+# ChangeBlockEffect accepts 4, 5 and 7; ChangeEffect accepts 0, 1, 3, 6, 9, 11
+# and 12. Reactive B is in the first list only, and sending it as an ordinary
+# effect is why it was the one thing on the pad that did nothing at all.
+verify("reactive B goes on the block command",
+       mp.uses_block_effect(mp.EFFECT_REACTIVE_B) is True)
+rb = mp.pkt_block_effect(mp.EFFECT_REACTIVE_B, color1=(1, 2, 3), color2=(4, 5, 6))
+verify("reactive B has no direction", rb[7] == mp.UNUSED, rb[7])
+verify("reactive B marks both colour positions unused",
+       rb[10] == mp.UNUSED and rb[14] == mp.UNUSED, (rb[10], rb[14]))
+verify("reactive B keeps its colours", rb[11:14] == b"\x01\x02\x03"
+       and rb[15:18] == b"\x04\x05\x06", rb[10:18].hex(" "))
+for effect in (mp.EFFECT_REACTIVE_A, mp.EFFECT_REACTIVE_C):
+    if mp.uses_block_effect(effect):
+        failures.append("effect %d must stay on the ordinary command" % effect)
+print("ok    reactive A and C stay ordinary     ChangeEffect accepts 3 and 11")
 
 
 # ── The customize table, the step that was missing entirely ──────────────────
@@ -430,6 +482,9 @@ pairs = [
                          color1=(255, 0, 0), direction=0)),
     ("probe customize table", probe.customize_table_packet(),
      mp.pkt_customize_table()),
+    ("probe reactive B", probe.reactive_b_packet(color=(255, 0, 0), color2=(0, 0, 255)),
+     mp.pkt_block_effect(mp.EFFECT_REACTIVE_B, brightness=60, speed=60,
+                         color1=(255, 0, 0), color2=(0, 0, 255))),
     ("probe custom activate", probe.custom_activate_packet(70),
      mp.pkt_custom_activate(70)),
 ]
