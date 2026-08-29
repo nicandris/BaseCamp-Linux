@@ -90,13 +90,23 @@ def parse_pactl_volume(text):
 
 
 def parse_pactl_mute(text):
-    """True/False from `pactl get-sink-mute` output, None if unrecognised."""
+    """True/False from `pactl get-sink-mute` output, None if unrecognised.
+
+    Not a comparison against `yes` alone: pactl translates this line too
+    (`Mute: ja`), and reading an unrecognised word as "not muted" would show a
+    level for a silent sink. Unknown is None here, like everything else in this
+    file, so the caller keeps the last good value instead of a wrong one.
+    """
     if not text or not text.startswith("Mute:"):
         return None
     parts = text.split()
     if len(parts) < 2:
         return None
-    return parts[1] == "yes"
+    if parts[1] == "yes":
+        return True
+    if parts[1] == "no":
+        return False
+    return None
 
 
 def _run(cmd):
@@ -118,7 +128,10 @@ def _read_pactl():
     level = parse_pactl_volume(_run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"]))
     if level is None:
         return None
-    return 0 if parse_pactl_mute(_run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"])) else level
+    muted = parse_pactl_mute(_run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"]))
+    if muted is None:                     # unreadable mute, so the level alone
+        return None                       # cannot be trusted to mean anything
+    return 0 if muted else level
 
 
 def _read():

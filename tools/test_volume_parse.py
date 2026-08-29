@@ -49,6 +49,10 @@ def test():
 
     assert parse_pactl_mute("Mute: yes") is True
     assert parse_pactl_mute("Mute: no") is False
+    # A word we do not know is None, not "not muted": pactl says `ja`/`nein` on
+    # a German desktop, and a muted sink must never read back as a level.
+    assert parse_pactl_mute("Mute: ja") is None
+    assert parse_pactl_mute("Mute: nein") is None
     assert parse_pactl_mute("Mute:") is None
     assert parse_pactl_mute("Sink not found") is None
     assert parse_pactl_mute(None) is None
