@@ -5,12 +5,17 @@
 # BaseCamp Linux
 
 > [!NOTE]
-> ### MacroPad support has landed
+> ### The MacroPad is supported, and measured
 >
 > Two owners ran `tools/macropad_probe.py` on their pads and sent the reports
 > back in [issue #85](https://github.com/ramisotti13-eng/BaseCamp-Linux/issues/85).
-> That closed the last gap in the protocol, the format of a key press, and the
-> MacroPad now has its own screen with lighting and key actions. Thank you both.
+> The first runs settled the format of a key press, which is what gave the
+> MacroPad its own screen with lighting and key actions. Five more runs of the
+> lighting pass then settled the lighting itself, one wrong reading at a time.
+> Nothing about this device is derived from the Windows software alone any
+> more: the key report, all eleven effects, both direction mappings, the speed
+> translation and the per key colour path have each been watched working on a
+> real pad. Thank you @FrankieDedo and @Thargorrr.
 >
 > The probe stays in the repository. If something on your pad does not behave,
 > running it and attaching the file it writes is still the fastest way to show
@@ -473,7 +478,13 @@ runs the action. Each key has a short debounce so one press is one action.
 
 - Effects: Static, Breathing, Wave, Tornado, Matrix, Yeti, Reactive A / B / C,
   Custom, Off
-- Brightness and speed, and one or two colours depending on the effect
+- Brightness, and speed where the effect has one. The slider has five real
+  positions: the pad wants a small number that runs downwards, not the 0 to
+  100 shown, and the translation differs per effect.
+- **Direction** for the two effects that travel: Wave goes Right, Left, Down
+  or Up, Tornado turns Clockwise or Counter-clockwise
+- One or two colours, depending on what the effect reads. A two colour Wave is
+  a gradient between them rather than two blocks.
 - **Custom** lights every key in its own colour: pick a key, set its colour in
   the inspector, then apply. The strip under each key in the grid shows the
   colour it will get.
