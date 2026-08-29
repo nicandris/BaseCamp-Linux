@@ -23,6 +23,7 @@ from shared.config import (
     _compute_lib_hash, _compute_main_lib_hash,
     macro_names,
 )
+from shared.volume import system_volume, start_watch
 from shared.ui_helpers import (CardColumns,
     BG, BG2, BG3, FG, FG2, BLUE, YLW, GRN, RED, BORDER,
     AccordionSection, LibraryPickerDialog, MultiUploadDialog, CustomRGBWindow,
@@ -232,7 +233,8 @@ class EverestMaxPanel(ctk.CTkFrame):
         # controller uses, so you can see what the keyboard is being sent.
         self._meters = {}
         for key, label_key in (("cpu", "meter_cpu"), ("ram", "meter_ram"),
-                               ("disk", "meter_disk"), ("net", "meter_net")):
+                               ("disk", "meter_disk"), ("net", "meter_net"),
+                               ("vol", "meter_volume")):
             row = ctk.CTkFrame(b1, fg_color="transparent")
             row.pack(fill="x", pady=2)
             self._reg(ctk.CTkLabel(row, text=self.T(label_key), width=52,
@@ -258,7 +260,7 @@ class EverestMaxPanel(ctk.CTkFrame):
         self._net_last = None
 
     def _tick_meters(self):
-        """Refresh the four meters. Runs only while this screen is visible:
+        """Refresh the meters. Runs only while this screen is visible:
         the shell calls refresh() when it is shown and on_hide() when it is
         left, so nothing polls in the background for a screen nobody sees."""
         try:
@@ -273,10 +275,17 @@ class EverestMaxPanel(ctk.CTkFrame):
                 dt = max(0.001, now - self._net_last[0])
                 mbs = ((io.bytes_sent + io.bytes_recv) - self._net_last[1]) / dt / 1e6
             self._net_last = (now, io.bytes_sent + io.bytes_recv)
+            # Volume is the one meter that is not psutil: it is what the
+            # loop pushes to the wheel display, so show the same number. The
+            # watcher started in refresh() makes this a variable read; without
+            # it this would fork a mixer command on the Tk thread every tick.
+            vol = system_volume()
             for key, value, shown in (("cpu", cpu, f"{cpu:.0f}%"),
                                       ("ram", ram, f"{ram:.0f}%"),
                                       ("disk", disk, f"{disk:.0f}%"),
-                                      ("net", min(mbs / 10 * 100, 100), f"{mbs:.1f}")):
+                                      ("net", min(mbs / 10 * 100, 100), f"{mbs:.1f}"),
+                                      ("vol", vol or 0,
+                                       "--" if vol is None else f"{vol:.0f}%")):
                 bar, lbl = self._meters[key]
                 bar.set(max(0.0, min(1.0, value / 100)))
                 lbl.configure(text=shown)
@@ -286,6 +295,7 @@ class EverestMaxPanel(ctk.CTkFrame):
 
     def refresh(self):
         self._sync_card_hints()
+        start_watch()          # follow the mixer while this screen is on show
         if getattr(self, "_meter_after", None) is None:
             self._tick_meters()
 
