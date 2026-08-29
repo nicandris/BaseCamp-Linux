@@ -1,8 +1,10 @@
 # Changelog
 
-## [3.1.2] - 2026-08-29
+## [Unreleased]
 
 - **The Everest Core is the same keyboard as the Max, and the application has never known the difference.** The Max is the Core with a numpad and a media dock attached, and both report product id `0x0001`, so nothing outside the keyboard can tell them apart. BaseCamp Linux has only ever been used with a Max, so it offers the numpad key actions and the main display to everyone, and on a Core those controls have nothing behind them. The keyboard itself knows: `11 14` answers with `FW_EXTEND_INFO`, which carries `byMMDockPlug` and `byNumpadPlug`, and the monitor loop already sends that command several times a second as a keepalive and throws the answer away. Read out of `SDKDLL.dll` (`GetExtendInfo`) and checked against an Everest Max here, where both flags read 1 and the rest of the struct lines up: the dock colour, the two timeouts and the five profile slots all come out where the struct says they should. `tools/everest_probe.py` is a standalone script for Everest owners that reports what their keyboard says is attached, so the screen can stop offering parts that are not there. It reads only, goes through `/dev/hidraw`, and never detaches a kernel driver.
+
+## [3.1.2] - 2026-08-29
 
 - **The interface no longer starts in German on a machine that is not (#92).** Reported by @Eirikur on Linux Mint, who could not find how to switch it and had grepped the code looking. The default was a hardcoded `"de"`, so a first start with no language chosen came up German wherever it was, and the way out of that is a setting labelled in German. It follows the system locale now, in gettext's order (LANGUAGE, LC_ALL, LC_MESSAGES, LANG), and falls back to English rather than German for a locale there is no translation for. Anyone who has picked a language keeps it: that choice is stored and still wins.
 
