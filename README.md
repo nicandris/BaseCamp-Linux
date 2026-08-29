@@ -328,6 +328,9 @@ Save that as `~/.config/autostart/basecamp-linux.desktop`. If you installed from
 
 ## Keyboard: Everest Max
 
+> **Everest Core owners:** the Core is the same keyboard as the Max without the numpad and the media dock, and it reports the same USB id, so the application currently shows those controls to everybody. `tools/everest_probe.py` reports what your keyboard says is attached. It reads only and needs no Python packages; please attach the file it writes to an issue and the screen can be taught to hide what is not there.
+
+
 The keyboard panel is split into a persistent **dashboard** at the top and collapsible sections below:
 
 - **Dashboard**: Live clock display with 24H/12H toggle, language switcher (DE/EN + custom), Analog/Digital display style, splash screen and autostart toggles
