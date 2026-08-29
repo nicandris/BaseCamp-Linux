@@ -4,34 +4,6 @@
 
 # BaseCamp Linux
 
-> [!NOTE]
-> ### The MacroPad is supported, and measured
->
-> Two owners ran `tools/macropad_probe.py` on their pads and sent the reports
-> back in [issue #85](https://github.com/ramisotti13-eng/BaseCamp-Linux/issues/85).
-> The first runs settled the format of a key press, which is what gave the
-> MacroPad its own screen with lighting and key actions. Five more runs of the
-> lighting pass then settled the lighting itself, one wrong reading at a time.
-> Nothing about this device is derived from the Windows software alone any
-> more: the key report, all eleven effects, both direction mappings, the speed
-> translation and the per key colour path have each been watched working on a
-> real pad. Thank you @FrankieDedo and @Thargorrr.
->
-> The probe stays in the repository. If something on your pad does not behave,
-> running it and attaching the file it writes is still the fastest way to show
-> us what the device is actually doing:
->
-> ```bash
-> curl -O https://raw.githubusercontent.com/ramisotti13-eng/BaseCamp-Linux/main/tools/macropad_probe.py
-> python3 macropad_probe.py
-> ```
->
-> It reads and does not write: no flash, no key bindings, no firmware, nothing
-> saved on the device. On Linux it talks to `/dev/hidraw` itself and needs no
-> Python packages; if it reports that it has no permission, run it once with
-> `sudo`. The lighting test is opt-in with `--lighting` and is gone when you
-> unplug the pad.
-
 **Unofficial Linux companion app for Mountain peripherals.**
 
 Mountain Base Camp is only available on Windows. This project brings full device control for the **Everest Max keyboard**, **Everest 60 keyboard**, **Makalu 67 mouse**, **Makalu Max mouse**, **DisplayPad** and **MacroPad** to Linux: display control, RGB lighting, button actions, monitor metrics, DPI, button remapping, multi-page display management and OBS integration.
@@ -560,6 +532,30 @@ runs the action. Each key has a short debounce so one press is one action.
   colour it will get.
 - **Save to pad** writes the current state into the pad's flash, so it survives
   a replug without the app running.
+
+### If the pad does something this page does not describe
+
+Everything this screen sends was measured on real hardware rather than read
+out of the Windows software: the key report, all eleven effects, both
+direction mappings, the speed translation and the per key colour path. That is
+the work of two owners who ran the probe on their pads and wrote up what they
+saw, run after run, in [issue #85](https://github.com/ramisotti13-eng/BaseCamp-Linux/issues/85).
+Thank you @FrankieDedo and @Thargorrr.
+
+The probe stays in the repository. If your pad behaves in a way this page does
+not cover, running it and attaching the file it writes is the fastest way to
+show what the device is actually doing:
+
+```bash
+curl -O https://raw.githubusercontent.com/ramisotti13-eng/BaseCamp-Linux/main/tools/macropad_probe.py
+python3 macropad_probe.py
+```
+
+It reads and does not write: no flash, no key bindings, no firmware, nothing
+saved on the device. On Linux it talks to `/dev/hidraw` itself and needs no
+Python packages; if it reports that it has no permission, run it once with
+`sudo`. The lighting test is opt-in with `--lighting` and is gone when you
+unplug the pad.
 
 ---
 
