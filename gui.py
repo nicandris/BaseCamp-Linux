@@ -142,6 +142,33 @@ def load_lang(code):
             return {}
 
 
+def default_lang(available):
+    """The language to start in when nobody has picked one yet.
+
+    This used to be German whatever the machine was set to, so every new user
+    outside Germany got a German interface and then had to find the setting to
+    get out of it, in German (#92). The system locale decides now, and English
+    is the fallback rather than German.
+
+    The variables are read in gettext's order. LANGUAGE is a colon separated
+    list of preferences and comes first, except under the C locale where it is
+    ignored, which is also what gettext does.
+    """
+    candidates = []
+    if (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES")
+            or os.environ.get("LANG") or "") not in ("C", "POSIX"):
+        candidates.extend((os.environ.get("LANGUAGE") or "").split(":"))
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        candidates.append(os.environ.get(var) or "")
+    for value in candidates:
+        code = value.split(".")[0].split("@")[0].split("_")[0].strip().lower()
+        if code and code in available:
+            return code
+    if "en" in available:
+        return "en"
+    return next(iter(available), "en")
+
+
 def available_langs():
     result = {}
     try:
@@ -811,9 +838,9 @@ class App(ctk.CTk):
             except FileNotFoundError:
                 return default
 
-        code = _read_cfg("language", "de")
+        code = _read_cfg("language", "")
         if code not in self._avail_langs:
-            code = "de"
+            code = default_lang(self._avail_langs)
         self._lang      = load_lang(code)
         self._lang_code = code
         self._rebuild_obs_type_map()

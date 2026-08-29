@@ -705,6 +705,8 @@ Two packages are optional and only unlock extras: `tkinterdnd2` for dragging ima
 
 > **GPU monitoring** requires `nvidia-smi` (NVIDIA only).
 
+> **Language:** the interface ships in English and German and follows your system locale on first start. Settings has a Language selector if you want the other one.
+
 ---
 
 ### USB permissions (required once, AppImage + source installs)
