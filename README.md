@@ -65,7 +65,17 @@ Mountain Base Camp is only available on Windows. This project brings full device
 
 ### AppImage (Debian, Ubuntu, Mint, Fedora, Nobara)
 
-Self-contained AppImages are available in the [releases](../../releases). No Python installation required.
+Self-contained AppImages, no Python installation required. Both of them live on
+**[release v2.1.0](../../releases/tag/v2.1.0)**, which is why that one is marked
+*Latest* on the releases page even though newer version numbers sit above it. An
+AppImage only has to be rebuilt when something native changes, and nothing
+native has changed since; every release after it is a source patch that the
+application applies to itself.
+
+So take the AppImage from v2.1.0 and then let the app bring itself up to date.
+It asks GitHub on startup, offers the newest version in a popup, and a source
+patch is a 200 KB download that installs in a couple of seconds. See
+[Automatic updates](#automatic-updates).
 
 | File | Distro |
 |------|--------|
@@ -86,6 +96,12 @@ To add BaseCamp Linux to your app menu, run it once with `--install`:
 This installs the icon and desktop entry to `~/.local/share/`. After that you can launch it directly from your application launcher.
 
 USB permissions still need to be set up once (see below).
+
+> **MacroPad owners with an older installation:** the pad arrived in 3.1.1, so a
+> `99-mountain.rules` written before that has no line for product id `0x0008`.
+> Without it the pad enumerates normally and the application still cannot reach
+> it. Run the USB permissions block for your distribution again, it covers the
+> pad, then unplug and replug it.
 
 > If you get a FUSE error on startup, add `--appimage-extract-and-run`:
 > ```bash
