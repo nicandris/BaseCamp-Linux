@@ -2,6 +2,8 @@
 import subprocess
 import threading
 import os
+import time
+from collections import OrderedDict, namedtuple
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont
 
@@ -12,6 +14,132 @@ except ImportError:
     FG, FG2 = "#e0e0e0", "#707090"
     BLUE, GRN, RED, YLW = "#0ea5e9", "#22c55e", "#dc2626", "#f5c542"
     BORDER = "#2a2a4a"
+
+
+# MPRIS hands over the cover as an address, not a picture: a local file for a
+# player that has one on disk, an http(s) one for a browser. It was being read
+# out of playerctl and then dropped, so nothing ever showed a cover although
+# the plugin's own help says it does (#99). Fetched once per address and kept,
+# because the poll runs every two seconds and the picture does not change in
+# between.
+_ART_CACHE = OrderedDict()      # url -> _Cover, oldest first
+_ART_FAILED = OrderedDict()     # url -> when the last attempt failed
+_ART_CACHE_MAX = 8
+_ART_FAILED_MAX = 32
+_ART_RETRY_S = 30
+_ART_MAX_BYTES = 4 * 1024 * 1024
+_ART_MAX_PIXELS = 40_000_000    # a cover, not a decompression bomb
+
+
+def _art_host_allowed(url):
+    """False for an address on this machine or this network.
+
+    mpris:artUrl is not the player's own idea: any page playing media sets it
+    through the Media Session API, so it is text a web page chooses and this
+    plugin would fetch on the desktop's behalf, from inside the household
+    network. A cover lives on a public server; an address that resolves onto
+    the loopback or a private range is asking this machine to reach something
+    a web page cannot reach itself, and is refused.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False
+    return bool(infos)
+
+
+# The two places a cover is ever drawn: across a key, where the title is
+# written over it, and beside the text on the card, where nothing is.
+_KEY_TILE, _CARD_TILE = 102, 190
+_Cover = namedtuple("_Cover", "key card")
+
+
+def _load_art(url):
+    """Both covers for a track, or None if there is none to be had.
+
+    Kept as the two finished tiles rather than the picture they came from:
+    those are the only sizes anything draws, and a player advertising a
+    3000x3000 cover would otherwise pin tens of megabytes per track in a
+    cache that is never let go of.
+    """
+    if not url:
+        return None
+    cover = _ART_CACHE.get(url)
+    if cover is not None:
+        _ART_CACHE.move_to_end(url)
+        return cover
+    # A failure is not remembered the way a picture is. A cover behind an
+    # http address can fail for a moment, and keeping that answer meant the
+    # cover never appeared for that track again however long it played.
+    if time.monotonic() - _ART_FAILED.get(url, -_ART_RETRY_S) < _ART_RETRY_S:
+        return None
+    art = None
+    try:
+        if url.startswith("file://"):
+            from urllib.parse import unquote, urlparse
+            art = Image.open(unquote(urlparse(url).path))
+        elif url.startswith(("http://", "https://")) and _art_host_allowed(url):
+            import io as _io
+            from urllib.request import urlopen
+            with urlopen(url, timeout=3) as response:
+                data = response.read(_ART_MAX_BYTES + 1)
+            if len(data) <= _ART_MAX_BYTES:
+                art = Image.open(_io.BytesIO(data))
+        if art is not None:
+            w, h = art.size
+            if w * h > _ART_MAX_PIXELS:
+                art = None      # not a cover, whatever it is
+            else:
+                art = art.convert("RGB")
+    except Exception:
+        art = None      # no cover is an ordinary answer, not a failure
+    if art is None:
+        _ART_FAILED[url] = time.monotonic()
+        _ART_FAILED.move_to_end(url)
+        while len(_ART_FAILED) > _ART_FAILED_MAX:
+            # The oldest, not all of them: clearing the lot threw away the
+            # entry just written, and the next poll two seconds later tried
+            # the same dead address all over again.
+            _ART_FAILED.popitem(last=False)
+        return None
+    _ART_FAILED.pop(url, None)
+    cover = _Cover(key=_cover_tile(art, _KEY_TILE),
+                   card=_cover_tile(art, _CARD_TILE, darken=0.0))
+    art.close()
+    _ART_CACHE[url] = cover
+    while len(_ART_CACHE) > _ART_CACHE_MAX:
+        # The oldest goes, not all of them: clearing the lot threw away the
+        # cover of whatever was playing, which is the one wanted next.
+        _ART_CACHE.popitem(last=False)
+    return cover
+
+
+def _cover_tile(art, size, darken=0.62):
+    """The cover, filled to a square, dimmed by `darken` so text over it stays
+    readable. A key has the title written across it; the card beside the text
+    does not, and asks for 0."""
+    w, h = art.size
+    side = min(w, h)
+    art = art.crop(((w - side) // 2, (h - side) // 2,
+                    (w - side) // 2 + side, (h - side) // 2 + side))
+    art = art.resize((size, size), Image.LANCZOS)
+    if not darken:
+        return art
+    return Image.blend(art, Image.new("RGB", (size, size), (0, 0, 0)), darken)
 
 
 def _system_env():
@@ -295,21 +423,50 @@ class Plugin:
     # ── Service ───────────────────────────────────────────────────────────────
 
     def start(self):
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        """Begin polling the player.
+
+        The stop was never cleared here, so once the plugin had been stopped
+        it stayed stopped for the rest of the session: the new thread found
+        the event already set and returned at once, and the panel's own
+        updates returned at their guard. Nothing was drawn from then on,
+        which is the very symptom #99 was about. It matters more now, because
+        assigning or clearing a key brings the page's services in line
+        straight away rather than only on a page switch, so a stop closely
+        followed by a start is an ordinary thing.
+
+        Each thread carries its own stop, so a stopped one can never be
+        revived alongside its successor.
+        """
+        self._stop.set()               # any predecessor ends here
+        stop = threading.Event()
+        self._stop = stop
+        # What is on the key and in the card is forgotten too. The panel
+        # restores a key's stored icon while this is stopped, so remembering
+        # what was drawn before means nothing is pushed for the track that
+        # is still playing and the key keeps the icon instead (#99).
+        self._dp_last_key = None
+        self._last_thumb_key = None
+        self._thread = threading.Thread(target=self._poll_loop, args=(stop,),
+                                        daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
 
-    def _poll_loop(self):
-        while not self._stop.is_set():
+    def _poll_loop(self, stop):
+        while not stop.is_set():
             try:
                 info = _get_media_info()
+                if info:
+                    # Here, not in _update_ui: that runs on the interface
+                    # thread and a cover behind an http address would freeze
+                    # the window for as long as the fetch takes.
+                    info["art"] = _load_art(info.get("art_url"))
                 self.ctx.schedule(0, lambda i=info: self._update_ui(i))
                 self._update_displaypad(info)
             except Exception:
                 pass
-            self._stop.wait(2)
+            stop.wait(2)
 
     def _update_ui(self, info):
         # Panel might not be built yet (plugin enabled but tab not opened),
@@ -398,14 +555,18 @@ class Plugin:
         player = _player_icon(info.get("player", ""))
 
         # Only regenerate if content changed (not position)
-        thumb_key = f"{title}|{artist}|{status}"
+        art = info.get("art")
+        thumb_key = f"{title}|{artist}|{status}|{art is not None}"
         if getattr(self, "_last_thumb_key", None) == thumb_key:
             return
         self._last_thumb_key = thumb_key
 
         try:
-            W, H = 440, 190
+            W, H = 440, _CARD_TILE
             img = Image.new("RGB", (W, H), (22, 22, 46))
+            if art is not None:
+                # Square cover on the right, the text keeps the room it had.
+                img.paste(art.card, (W - H, 0))
             draw = ImageDraw.Draw(img)
 
             # Try to find a good font
@@ -432,7 +593,7 @@ class Plugin:
 
             # Title (wrapped)
             y = 16
-            max_text_w = W - 40
+            max_text_w = W - 40 - (H if art is not None else 0)
             words = title.split()
             lines = []
             line = ""
@@ -453,9 +614,13 @@ class Plugin:
                 draw.text((16, y), ln, fill=(224, 224, 224), font=font_title)
                 y += 26
 
-            # Artist
+            # Artist, kept inside the text column: with a cover on the right
+            # there is less room than the card is wide.
             if artist:
                 y = max(y + 4, 100)
+                while (draw.textbbox((0, 0), artist, font=font_artist)[2]
+                       > max_text_w and len(artist) > 5):
+                    artist = artist[:-2]
                 draw.text((16, y), artist, fill=(112, 112, 144),
                           font=font_artist)
 
@@ -472,7 +637,10 @@ class Plugin:
             if sym:
                 bbox = draw.textbbox((0, 0), sym, font=font_artist)
                 sw = bbox[2] - bbox[0]
-                draw.text((W - sw - 16, H - 28), sym, fill=sym_color,
+                # Right edge of the text column, which is the card's own edge
+                # only when there is no cover sitting in front of it.
+                right = W - (H if art is not None else 0)
+                draw.text((right - sw - 16, H - 28), sym, fill=sym_color,
                           font=font_artist)
 
             self._thumb_photo = ctk.CTkImage(
@@ -497,11 +665,16 @@ class Plugin:
         return ImageFont.load_default()
 
     def _find_dp_key(self):
-        """Find which DisplayPad button has 'now_playing' action type assigned."""
+        """Which DisplayPad button carries the 'now_playing' action.
+
+        Through the context, which answers for the page that is on the pad.
+        Reading the stored actions directly meant only the main page was ever
+        looked at, so a key on a sub-page was never found: nothing was drawn
+        on it, and the icon it had before stayed where it was (#99). Same
+        fix the other widget plugins got in #82.
+        """
         try:
-            from shared.config import _load_displaypad_actions
-            actions = _load_displaypad_actions()
-            for i, act in enumerate(actions):
+            for i, act in enumerate(self.ctx.get_displaypad_actions()):
                 if act.get("type") == "now_playing":
                     return i
         except Exception:
@@ -517,7 +690,10 @@ class Plugin:
 
         if not info or not info.get("title"):
             # Nothing playing -- show idle icon
-            dp_key = "idle"
+            # The key index belongs in here: which key this is depends on
+            # the page now, so the same track on a different key has to be
+            # drawn again (#99).
+            dp_key = ("idle", self._dp_key)
             if self._dp_last_key == dp_key:
                 return
             self._dp_last_key = dp_key
@@ -534,15 +710,20 @@ class Plugin:
         pos = info.get("position", 0)
         dur = info.get("duration", 0)
 
-        # Only re-upload when content or status changes (not every 2s for position)
-        dp_key = f"{title}|{status}"
+        # Only re-upload when content or status changes (not every 2s for
+        # position). The cover is part of that: a player can hand over the
+        # track before it has the picture for it.
+        art = info.get("art")
+        dp_key = (title, status, art is not None, self._dp_key)
         if self._dp_last_key == dp_key:
             return
         self._dp_last_key = dp_key
 
         try:
             S = 102
-            img = Image.new("RGB", (S, S), (16, 16, 36))
+            over_art = art is not None
+            img = (art.key.copy() if over_art
+                   else Image.new("RGB", (S, S), (16, 16, 36)))
             draw = ImageDraw.Draw(img)
             font = self._get_dp_font(11)
             font_sm = self._get_dp_font(9)
@@ -579,7 +760,11 @@ class Plugin:
                 # Truncate if too long
                 while draw.textbbox((0, 0), artist, font=font_sm)[2] > S - 12 and len(artist) > 5:
                     artist = artist[:-2]
-                draw.text((6, y), artist, fill=(100, 100, 140), font=font_sm)
+                # Lighter over a cover: the muted grey the plain background
+                # was built for disappears into a busy picture.
+                draw.text((6, y), artist,
+                          fill=(190, 190, 210) if over_art else (100, 100, 140),
+                          font=font_sm)
 
             # Play/Pause icon bottom
             if status == "Playing":

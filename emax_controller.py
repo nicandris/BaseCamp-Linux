@@ -3,6 +3,7 @@
 import usb.core
 import usb.util
 import datetime
+import signal
 import sys
 import os
 import time
@@ -53,20 +54,71 @@ def make_packet(*args):
     return pkt
 
 def _claim(dev):
-    dev._reattach = False
     if dev.is_kernel_driver_active(INTERFACE):
         dev.detach_kernel_driver(INTERFACE)
-        dev._reattach = True
     usb.util.claim_interface(dev, INTERFACE)
 
-def _release(dev):
-    usb.util.release_interface(dev, INTERFACE)
-    if getattr(dev, '_reattach', False):
-        try:
-            dev.attach_kernel_driver(INTERFACE)
-        except Exception:
-            pass
+def _release(dev, expect_gone=False):
+    """Hand interface 3 back. `expect_gone` for a handle already known dead.
+
+    A reclaim after a port reset is releasing a handle whose device has just
+    re-enumerated, so the release failing is the premise rather than news,
+    and saying so would be a warning on every suspend.
+    """
+    try:
+        usb.util.release_interface(dev, INTERFACE)
+    except Exception as e:
+        # A keyboard that has gone away mid-run cannot be released, and that
+        # must not skip the reattach below or escape the caller's `finally`:
+        # this is the one place that hands interface 3 back.
+        if not expect_gone:
+            print(f"interface {INTERFACE} not released: {e}",
+                  file=sys.stderr, flush=True)
+    # usbhid owns this interface when we are not using it, so hand it back
+    # whether or not this process is the one that took it away. A run that
+    # was killed before it could release leaves the interface with no driver
+    # at all, and the next run then sees nothing to reattach and would leave
+    # it that way for good. Reporting a failure matters more than the attempt:
+    # silence here is what let that state survive unnoticed.
+    if getattr(dev, "_no_reattach", False):
+        usb.util.dispose_resources(dev)
+        return
+    failed = None
+    try:
+        dev.attach_kernel_driver(INTERFACE)
+    except Exception as e:
+        failed = e
+    if failed is not None and not _driver_back(dev):
+        # The attempt failing is not the news; the interface still having no
+        # driver is. A port reset re-enumerates the board and the kernel
+        # binds it again by itself, so the attach comes back "Resource busy"
+        # or "Entity not found" and the interface is nonetheless in the hands
+        # it belongs in. Saying so anyway would be a warning after every
+        # suspend, and warnings nobody can act on are how the real one got
+        # missed for as long as it did.
+        print(f"kernel driver not reattached on interface {INTERFACE}: {failed}",
+              file=sys.stderr, flush=True)
     usb.util.dispose_resources(dev)
+
+
+def _driver_back(dev):
+    """True if interface 3 has a kernel driver on it, whoever put it there."""
+    try:
+        return bool(dev.is_kernel_driver_active(INTERFACE))
+    except Exception:
+        # The handle is dead, which is the re-enumeration case: ask sysfs,
+        # which is about the device rather than about this handle.
+        try:
+            for entry in os.listdir("/sys/bus/usb/devices"):
+                path = f"/sys/bus/usb/devices/{entry}:1.{INTERFACE}/driver"
+                if entry.count(":") == 0 and os.path.islink(path):
+                    vid = open(f"/sys/bus/usb/devices/{entry}/idVendor").read()
+                    pid = open(f"/sys/bus/usb/devices/{entry}/idProduct").read()
+                    if vid.strip() == f"{VID:04x}" and pid.strip() == f"{PID:04x}":
+                        return True
+        except OSError:
+            pass
+        return False
 
 def _get_claimed_device():
     """Find keyboard, claim Interface 3 with retries. Returns dev or exits."""
@@ -88,7 +140,7 @@ def _reclaim(dev):
     the claimed interface dead: every write fails from then on.
     """
     try:
-        _release(dev)
+        _release(dev, expect_gone=True)
     except Exception:
         pass
     for _ in range(20):
@@ -779,7 +831,7 @@ def upload_main_display(image_path, frame=0, activate=False):
     _claim(dev)
     try:
         _upload_main_display_image(dev, img_bytes, activate=activate)
-        dev._reattach = False
+        dev._no_reattach = True   # the upload resets the port, usbhid returns by itself
     finally:
         _release(dev)
 
@@ -796,13 +848,7 @@ def upload_icon(button_idx, image_path, frame=0):
         _upload_icon_image(dev, button_idx, img_bytes)
     finally:
         # Release interface before USB reset to restore numpad
-        usb.util.release_interface(dev, INTERFACE)
-        if getattr(dev, '_reattach', False):
-            try:
-                dev.attach_kernel_driver(INTERFACE)
-            except Exception:
-                pass
-        usb.util.dispose_resources(dev)
+        _release(dev)
 
 def set_icon_once(button_idx, variant, action=None, action_type=0x04):
     dev = usb.core.find(idVendor=VID, idProduct=PID)
@@ -1125,7 +1171,9 @@ def controller_loop(style=STYLE_ANALOG):
 
                 # Send all metrics (keyboard shows whichever the wheel selects)
                 for metric_type in range(5):
-                    value = min(int(_smooth[metric_type]), 999)
+                    # One packet byte, so 0-255. Network MB/s is the only
+                    # metric that is not a percentage and can leave that range.
+                    value = max(0, min(int(_smooth[metric_type]), 255))
                     dev.write(EP_OUT, make_packet(0x11, 0x81, metric_type, 0x00, value))
                     _handle_btn_resp(_read(dev, timeout=150))
 
@@ -1168,8 +1216,56 @@ def controller_loop(style=STYLE_ANALOG):
 
 # ── CLI ────────────────────────────────────────────────────────────────────
 
+_stopping = False
+
+
+def _exit_on_term(_sig, _frame):
+    """Leave through the normal exit path when the GUI stops us.
+
+    Every caller that stops a controller uses Popen.terminate(), which is
+    SIGTERM, and the default handling for that ends the process where it
+    stands: no `finally`, so the claimed interface is never released and
+    usbhid never gets it back. Turning it into KeyboardInterrupt makes a stop
+    from the application take exactly the path Ctrl-C already took.
+
+    Only the first one raises. The application stops a monitor in one place
+    and clears strays with pkill in another, so two can arrive close
+    together, and the second landing inside the release would interrupt the
+    very cleanup this exists to run.
+    """
+    global _stopping
+    if _stopping:
+        return
+    _stopping = True
+    # The application waits for this process on its own interface thread, so
+    # a cleanup that blocks would freeze the window. Only the first signal
+    # raises, so a second one cannot break into the release; this is what
+    # ends the process if the release itself does not come back.
+    try:
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        signal.alarm(5)
+    except Exception:
+        pass
+    raise KeyboardInterrupt
+
+
 def main():
-    args = sys.argv[1:]
+    """Entry point for both ways in.
+
+    The stop has to be caught here rather than under `if __name__ ==
+    "__main__"`: the packaged build runs emax_entry.py, which imports this
+    module and calls main(), so it never reaches that guard. Without it a
+    stop during an upload or an icon write ended with a traceback and a
+    non-zero exit, which the screen reads as the upload having failed.
+    """
+    signal.signal(signal.SIGTERM, _exit_on_term)
+    try:
+        _run(sys.argv[1:])
+    except KeyboardInterrupt:
+        pass    # Ctrl-C or the stop from the application; both are normal
+
+
+def _run(args):
     mode = "time"
     style_arg = None
     btn_idx = None

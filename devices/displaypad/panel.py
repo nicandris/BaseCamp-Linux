@@ -443,6 +443,27 @@ def _load_gif_display_frames(path, size):
     return frames if len(frames) > 1 else None
 
 
+# Every picture the application draws for a key is named the same way: what
+# it is, which page, which key. The widget plugins already write
+# dp_<plugin>_p<page>_k<key>.png, and the application did not (#95): labels
+# were dp_label_<page>_<key>.png, and folder icons dropped the page entirely
+# on page 0, which is a legacy form from before sub-pages existed.
+_ICON_KINDS = ("label", "folder")
+
+
+def _generated_icon_name(kind, page, idx):
+    """Config path of an icon the application draws itself."""
+    return os.path.join(CONFIG_DIR, f"dp_{kind}_p{page}_k{idx}.png")
+
+
+def _legacy_icon_names(kind, page, idx):
+    """What that same icon was called before the scheme was settled."""
+    names = [f"dp_{kind}_{page}_{idx}.png"]
+    if kind == "folder" and page == 0:
+        names.append(f"dp_{kind}_{idx}.png")   # older still, page 0 only
+    return [os.path.join(CONFIG_DIR, n) for n in names]
+
+
 def _make_thumb(path, size, rotation=0):
     try:
         img = Image.open(path).convert("RGB").resize((size, size), Image.LANCZOS)
@@ -614,6 +635,10 @@ def _confirm_delete_page(app, panel, page_id):
 
 _DIALOG_TILE  = 90   # thumbnail size in dialog
 _PANEL_TILE   = 84   # key tile on the screen (was 48 in the old column)
+# Shortest gap between two redraws of one key tile while a widget keeps
+# writing the same file. A clock pushes once a second and wants every
+# one of them; a video pushes thirty times and wants none of that (#96).
+_TILE_REDRAW_MIN = 0.5
 _INSPECTOR_W  = 236  # width of the key inspector beside the grid
 
 def action_type_ids(app, include_page=True):
@@ -2442,11 +2467,22 @@ class DisplayPadPanel(ctk.CTkFrame):
         self._dialog_win       = None
         self._upload_queue     = queue.Queue()
         self._plugin_frame_keys = {}
-        # Per key, the image path the grid was last redrawn for, so a widget
-        # pushing frames only costs a redraw when the picture really changed.
-        self._tile_shown = {}     # page -> {key idx} currently showing a
-                                          # plugin's live frame instead of the
-                                          # key's icon (see _persistable_images)
+        # Per key, the image path the grid was last redrawn for, and when.
+        # A widget that keeps writing the same file name still changes what
+        # the key shows, so the path alone cannot decide this (#96).
+        self._tile_shown = {}     # key idx -> path last drawn
+        self._tile_drawn = {}     # key idx -> time.monotonic() of that draw
+        self._svc_sync_id = None  # pending widget service sync (#97)
+        # Noted by the plugin threads, drawn by the interface thread, so the
+        # note and the taking of it are under one lock.
+        self._tile_lock = threading.Lock()
+        self._tile_dirty = set()  # keys whose picture changed, not yet drawn
+        self._tile_pass_due = False   # a pass is booked and has not run yet
+        # Set the moment the application starts going away, so a worker
+        # about to open the device does not do it into an interpreter that
+        # is already tearing down: libusb aborts the process on that
+        # ("libusb_ref_device: Assertion `refcnt >= 2' failed").
+        self._closing = threading.Event()
         self._fullscreen_group = set()   # key indices that form a synced fullscreen GIF
         self._rotation         = _load_displaypad_rotation()
         self._brightness       = _load_displaypad_brightness()
@@ -2550,6 +2586,8 @@ class DisplayPadPanel(ctk.CTkFrame):
             acts = self._page_actions.get(p)
             if p != 0 and acts and acts[0].get("type", "none") == "none":
                 acts[0] = _back_act()
+
+        self._migrate_generated_icon_names()
 
         self._images = dict(self._page_images.get(0, {}))
         # A value that is not a path is dropped rather than carried into the
@@ -3318,11 +3356,68 @@ class DisplayPadPanel(ctk.CTkFrame):
         return max(self._all_page_ids()) + 1
 
     def _folder_icon_name(self, page, idx):
-        """Config path of the auto folder-label icon for a nav button. Page 0
-        keeps the legacy dp_folder_{idx}.png name; sub-pages qualify by page id
-        so labels don't collide across pages."""
-        fname = f"dp_folder_{idx}.png" if page == 0 else f"dp_folder_{page}_{idx}.png"
-        return os.path.join(CONFIG_DIR, fname)
+        """Where the auto folder-label icon for a nav button is written."""
+        return _generated_icon_name("folder", page, idx)
+
+    def _folder_icon_drawn(self, page, idx):
+        """The drawn folder label for this key, whatever it is called, or None.
+
+        Normally the one name. A legacy one only when the rename could not
+        happen, which is a config directory that cannot be written to: that
+        should not also cost the picture, since the key would silently fall
+        back to the generic folder icon and the label would look lost.
+        """
+        for path in (_generated_icon_name("folder", page, idx),
+                     *_legacy_icon_names("folder", page, idx)):
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _migrate_generated_icon_names(self):
+        """Rename the icons this application drew to the one scheme (#95).
+
+        The page and the key are known from where the entry sits, so the old
+        name does not have to be parsed, only recognised. A file that cannot
+        be renamed keeps its old name and its stored path, which still works;
+        the point of this is a config directory that reads consistently, not
+        something anything depends on. Idempotent, so it costs one directory
+        walk on every later start and does nothing.
+        """
+        changed = False
+        for page, imgs in self._page_images.items():
+            if not isinstance(imgs, dict):
+                continue
+            for key, path in list(imgs.items()):
+                if not isinstance(path, str):
+                    continue
+                try:
+                    idx = int(key)
+                except (TypeError, ValueError):
+                    continue
+                for kind in _ICON_KINDS:
+                    if path not in _legacy_icon_names(kind, page, idx):
+                        continue
+                    new = _generated_icon_name(kind, page, idx)
+                    try:
+                        if os.path.exists(path):
+                            # Unconditionally, even when the new name is
+                            # already taken: what the configuration points at
+                            # is this key's picture by definition, and a file
+                            # left under the new name by an earlier half
+                            # finished run is not. Repointing without moving
+                            # would have shown that stale one instead.
+                            os.replace(path, new)
+                    except OSError as e:
+                        print(f"[DisplayPad] keeping {path}: {e}")
+                        break
+                    if os.path.exists(new):
+                        imgs[key] = new
+                        changed = True
+                    break
+        if changed:
+            _save_displaypad_buttons(
+                self._persistable_images(0, self._page_images.get(0, {})))
+            self._save_sub_pages()
 
     def _inject_page_icons(self, page):
         """Give every navigation button on `page` its icon: a custom icon set on
@@ -3346,9 +3441,8 @@ class DisplayPadPanel(ctk.CTkFrame):
                     # editor wins over the default folder icon (#30 custom icon).
                     self._images[str(i)] = user_img
                 else:
-                    labeled = self._folder_icon_name(page, i)
-                    self._images[str(i)] = (labeled if os.path.exists(labeled)
-                                            else self._folder_icon)
+                    labeled = self._folder_icon_drawn(page, i)
+                    self._images[str(i)] = labeled or self._folder_icon
             elif t == "back":
                 self._images[str(i)] = self._back_icon
 
@@ -3546,7 +3640,45 @@ class DisplayPadPanel(ctk.CTkFrame):
                 self._refresh_panel_tile(idx)
             if not self._uploading and not self._animating:
                 self.after(200, self._start_upload)
+            self._schedule_service_sync()
         self._sync_editors(page)
+
+    def _schedule_service_sync(self):
+        """Ask for the page's widget services to be brought in line, shortly.
+
+        Assigning a widget to a key has to start that widget's service, and
+        clearing the last key that used it has to stop it. Both were only ever
+        done on a page switch, so a widget assigned to a key on the page you
+        were already looking at simply never started: nothing appeared on the
+        pad or in the editor, though the key was stored and worked after a
+        restart or a switch away and back (#97). Clearing one had the mirror
+        problem, leaving the thread polling and painting a key nobody had
+        assigned it to any more.
+
+        Deferred and coalesced because applying the actions dialog saves all
+        twelve rows in a loop, and a sync per row would stop a service on one
+        row and start it again on the next.
+        """
+        if getattr(self, "_svc_sync_id", None) is not None:
+            try:
+                self.after_cancel(self._svc_sync_id)
+            except Exception:
+                pass
+        try:
+            self._svc_sync_id = self.after(250, self._sync_page_services)
+        except Exception:
+            # The window is going away, so there is no page to bring in line.
+            self._svc_sync_id = None
+
+    def _sync_page_services(self):
+        self._svc_sync_id = None
+        pm = getattr(self._app, "_plugin_manager", None)
+        if not pm:
+            return
+        try:
+            pm.sync_services_for_page(self._current_page)
+        except Exception as e:
+            print(f"[Plugin] sync_services_for_page failed: {e}")
 
     def _sync_editors(self, page):
         """Show the stored action in the editor that did not just write it.
@@ -3596,7 +3728,7 @@ class DisplayPadPanel(ctk.CTkFrame):
         if not (is_blank or auto):
             return  # user-assigned image — keep it
         label = action.strip()
-        icon_path = os.path.join(CONFIG_DIR, f"dp_label_{page}_{idx}.png")
+        icon_path = _generated_icon_name("label", page, idx)
         try:
             _make_label_icon(label, icon_path)
         except Exception:
@@ -4336,18 +4468,55 @@ class DisplayPadPanel(ctk.CTkFrame):
         before the widget was assigned is the blank one, and it stayed blank
         in the editor for as long as nothing else happened to redraw it (#90).
 
-        Only on a change of path, so a video pushing frames does not redraw the
-        same file thirty times a second.
+        A change of path is drawn at once. The same path is drawn again at
+        most a few times a second: a clock or a system monitor rewrites one
+        file name every second and only its content changes, so waiting for
+        the path to change meant the editor kept the first frame it ever drew
+        while the pad showed the current one, until something unrelated
+        happened to redraw that tile (#96). The floor is what keeps a video
+        pushing thirty frames a second from costing thirty redraws.
         """
         path = self._images.get(str(idx))
-        if not path or self._tile_shown.get(idx) == path:
+        if not path:
+            return
+        now = time.monotonic()
+        if self._tile_shown.get(idx) == path and \
+                now - self._tile_drawn.get(idx, 0.0) < _TILE_REDRAW_MIN:
             return
         self._tile_shown[idx] = path
+        self._tile_drawn[idx] = now
+        # Noted, not drawn: a page of widgets pushes a dozen frames a second
+        # between them, and one scheduled redraw each would put a dozen file
+        # reads and resizes a second on the interface thread. One pass draws
+        # whatever has piled up.
+        with self._tile_lock:
+            self._tile_dirty.add(idx)
+            if self._tile_pass_due:
+                return
+            # Marked before the call, not after it. Tk runs the callback on
+            # its own thread, and it can have run and cleared this again
+            # before after() has even returned here: storing the answer
+            # afterwards would leave a mark for a pass that is already over,
+            # and no pass would ever be asked for again.
+            self._tile_pass_due = True
         try:
-            self.after(0, lambda i=idx: self._refresh_panel_tile(i))
+            self.after(0, self._draw_dirty_tiles)
         except Exception:
             # The window is going away; a tile nobody will see is no loss.
-            pass
+            with self._tile_lock:
+                self._tile_pass_due = False
+                self._tile_dirty.discard(idx)
+
+    def _draw_dirty_tiles(self):
+        """Redraw every key noted since the last pass."""
+        with self._tile_lock:
+            self._tile_pass_due = False
+            dirty, self._tile_dirty = self._tile_dirty, set()
+        for idx in sorted(dirty):
+            try:
+                self._refresh_panel_tile(idx)
+            except Exception:
+                pass
 
     def _refresh_panel_tile(self, idx):
         rot = self._rotation
@@ -4455,8 +4624,10 @@ class DisplayPadPanel(ctk.CTkFrame):
         self._persist_images()
         self._save_page_action(self._current_page, idx, "none", "")
         self._refresh_panel_tile(idx)
-        if idx == self._selected_key:
-            self._load_inspector()
+        # The key you just cleared is the one you are working on, so the
+        # inspector moves to it. It used to stay on whichever key was selected
+        # before, which read as the clear having hit the wrong key (#98).
+        self._select_key(idx)
         self._start_upload()
 
     def _open_app_picker(self):
@@ -4501,8 +4672,8 @@ class DisplayPadPanel(ctk.CTkFrame):
         if self._current_page == 0:
             for i, act in enumerate(cur_actions):
                 if act.get("type") == "page":
-                    labeled = os.path.join(CONFIG_DIR, f"dp_folder_{i}.png")
-                    page_btns[str(i)] = labeled if os.path.exists(labeled) else self._folder_icon
+                    labeled = self._folder_icon_drawn(self._current_page, i)
+                    page_btns[str(i)] = labeled or self._folder_icon
                     kept_page_actions[i] = dict(act)
         self._images = {str(i): self._blank_icon for i in range(NUM_KEYS)}
         self._images.update(page_btns)
@@ -4522,6 +4693,11 @@ class DisplayPadPanel(ctk.CTkFrame):
             if 0 <= idx < len(new_actions):
                 new_actions[idx] = act
         self._page_actions[self._current_page] = new_actions
+        # The services follow the page's actions, and this is the one writer
+        # that does not go through _save_page_action, so it has to ask for
+        # itself. Without it, clearing a page left a widget's thread running
+        # and painting a key nobody had assigned it to (#97).
+        self._schedule_service_sync()
 
         if self._current_page == 0:
             save_imgs = dict(page_btns)  # only keep page buttons in config
@@ -4618,6 +4794,9 @@ class DisplayPadPanel(ctk.CTkFrame):
         # device returns [Errno 16] Resource busy (issue #26).
         self._key_released.wait(timeout=1.5)
         self._usb_lock.acquire()
+        if self._closing.is_set():
+            self._usb_lock.release()
+            return
         try:
             usb_dev, hid_dev = _open_interfaces()
         except Exception as e:
@@ -4647,6 +4826,8 @@ class DisplayPadPanel(ctk.CTkFrame):
             # sessions don't linger on the device.
             _blank_bgr = b'\x00' * (ICON_SIZE * ICON_SIZE * 3)
             for k in range(NUM_KEYS):
+                if self._closing.is_set():
+                    return      # the application is going, the pad can wait
                 if k not in assigned:
                     _upload_button(usb_dev, hid_dev, k, _blank_bgr)
 
@@ -4668,6 +4849,8 @@ class DisplayPadPanel(ctk.CTkFrame):
 
             total = len(static) + len(animated)
             for n, (key_index, bgr) in enumerate(sorted(static.items())):
+                if self._closing.is_set():
+                    return
                 self.after(0, lambda n=n, k=key_index: self._info_label.configure(
                     text=self.T("dp_uploading_key", k=k+1, n=n+1, total=total), text_color=FG2))
                 _upload_button(usb_dev, hid_dev, key_index, bgr)
@@ -4677,6 +4860,8 @@ class DisplayPadPanel(ctk.CTkFrame):
                 return
 
             for n, (key_index, frames) in enumerate(sorted(animated.items())):
+                if self._closing.is_set():
+                    return
                 self.after(0, lambda n=n+len(static), k=key_index:
                            self._info_label.configure(
                                text=self.T("dp_uploading_key", k=k+1, n=n+1, total=total),
@@ -4983,7 +5168,7 @@ class DisplayPadPanel(ctk.CTkFrame):
                     pass
                 holding = False
 
-        while not self._plugin_worker_stop.is_set():
+        while not (self._plugin_worker_stop.is_set() or self._closing.is_set()):
             # Yield the device immediately the moment anything else wants
             # it — don't linger. A plugin pushing frequently, or a steady
             # stream of key reads, must never starve a manual upload or a
@@ -5043,6 +5228,12 @@ class DisplayPadPanel(ctk.CTkFrame):
                 self._usb_lock.acquire()
                 holding = True
                 self._key_released.clear()
+                if self._closing.is_set():
+                    # The wait above is up to 1.5 s and the open below is
+                    # seconds more; checking only at the top of the loop
+                    # narrowed the teardown race rather than closing it.
+                    _release()
+                    return
                 try:
                     usb_dev, hid_dev = _open_interfaces()
                     _init_device(hid_dev)

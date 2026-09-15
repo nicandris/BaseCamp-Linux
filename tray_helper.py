@@ -7,13 +7,26 @@ notification area recreated, idle reaping). pystray's Xorg backend raises
 systray host window is destroyed; left unhandled that kills the tray icon for
 good (GitHub issue #21). We supervise ``icon.run()`` and simply re-dock.
 
+pystray also has a quieter version of the same ending (issue #100). It catches
+that ``AssertionError`` itself, logs "Failed to dock icon" with the traceback,
+and notes in a comment that it must "retry later" -- but there is no later:
+nothing in the Xorg backend ever tries to dock again, and ``run()`` neither
+returns nor raises, so the supervision below has nothing to react to. The icon
+is simply gone. ``_watch_docked`` is what notices that and ends the run so a
+fresh icon can be built.
+
 The logic lives in main() so a thin frozen entry (tray_entry.py) can import it,
 which lets the source overlay replace this file for live updates (issue #20
 follow-up). Run directly (`python tray_helper.py <pid> [lang.json]`) still works.
 """
-import sys, os, signal, json, time
+import sys, os, signal, json, threading, time
 import pystray
 from PIL import Image
+
+# How often to ask whether the icon is still docked. It takes two answers in
+# a row for the icon to be rebuilt, so the notification area may be gone for
+# up to twice this without anything happening. See watch_docked.
+_DOCK_POLL_S = 3.0
 
 
 def _res_dir():
@@ -22,6 +35,66 @@ def _res_dir():
     if getattr(sys, "frozen", False):
         return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def watch_docked_applies(icon):
+    """True if this icon can lose its notification area without saying so.
+
+    Only the Xorg backend docks into a systray host window; the AppIndicator
+    and Windows backends have no such window and no such failure.
+    """
+    return hasattr(type(icon), "_systray_manager") or hasattr(icon, "_systray_manager")
+
+
+def watch_docked(icon, should_run, poll=_DOCK_POLL_S, sleep=time.sleep):
+    """End this icon's run once it has quietly lost the notification area.
+
+    pystray holds the systray host's window while the icon is docked and
+    clears it when that window is destroyed. If it cannot find a new host it
+    logs "Failed to dock icon", notes in a comment that it must retry later,
+    and then never does: `run()` neither returns nor raises, so there is no
+    icon and nothing to react to (issue #100). Stopping the run is what lets
+    the supervisor build a fresh one.
+
+    Waiting until it has been docked once keeps this from firing on a desktop
+    that simply has no notification area yet at login, which is the state the
+    icon starts in.
+    """
+    docked, gone = False, 0
+    while should_run():
+        sleep(poll)
+        if getattr(icon, "_systray_manager", None) is not None:
+            docked, gone = True, 0
+            continue
+        if not docked:
+            # Never docked. That is the ordinary state at login, and also the
+            # state a rebuilt icon lands in when the panel has not come back
+            # yet: pystray logs "Failed to dock icon" and never looks again,
+            # so the icon that was built to replace a lost one is lost too.
+            # A host that has since appeared is the signal to try once more.
+            try:
+                if icon._get_systray_manager() is not None:
+                    print("[Tray] a notification area appeared, docking into it",
+                          file=sys.stderr, flush=True)
+                    icon.stop()
+                    return True
+            except Exception:
+                pass
+            continue
+        # Two in a row, not one. pystray clears the host window first and
+        # only then looks for a new one, so a single look can land inside
+        # its own recovery and tear down an icon that was about to be fine.
+        gone += 1
+        if gone < 2:
+            continue
+        print("[Tray] the notification area went away, docking again",
+              file=sys.stderr, flush=True)
+        try:
+            icon.stop()
+        except Exception:
+            pass
+        return True
+    return False
 
 
 def main():
@@ -137,10 +210,28 @@ def main():
     backoff = 1.0
     while state["run"] and main_alive():
         started = time.monotonic()
+        # One watcher per icon, ended with it. Without this, a session with no
+        # notification area at all keeps every watcher it ever started: they
+        # are waiting for an icon to be docked that never will be, and this
+        # loop builds a fresh one every backoff.
+        done = threading.Event()
         try:
-            build_icon().run()
+            icon = build_icon()
+            if watch_docked_applies(icon):
+                threading.Thread(
+                    target=watch_docked,
+                    # `done` bound here and not looked up later: it is
+                    # rebound at the top of every turn of this loop, and a
+                    # lambda that reads the name would ask the next run's
+                    # event whether this run is over, which it never is.
+                    args=(icon, lambda d=done: (not d.is_set()
+                                                and state["run"] and main_alive())),
+                    daemon=True).start()
+            icon.run()
         except Exception as e:
             print(f"[Tray] {type(e).__name__}: {e} — re-docking", file=sys.stderr)
+        finally:
+            done.set()
         if not state["run"] or not main_alive():
             break
         if time.monotonic() - started > 5.0:

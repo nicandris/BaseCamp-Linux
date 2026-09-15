@@ -769,7 +769,7 @@ class UpdateAvailableDialog(ctk.CTkToplevel):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-APP_VERSION = "3.1.3"
+APP_VERSION = "3.1.4"
 
 # Window size. The minimum is what the widest screen needs: sidebar plus a
 # 6x2 key grid plus the inspector column, measured rather than guessed.
@@ -1685,7 +1685,33 @@ class App(ctk.CTk):
     # first sight of it put a full "cannot be opened" notice on screen during
     # an ordinary page switch (#80). Only a denial that survives this many
     # consecutive scans, roughly fifteen seconds, is a real one.
+    #
+    # Counted per node, not per device (#86). An upload detaches the kernel
+    # driver from an interface and gives it back afterwards, which makes the
+    # kernel build that interface a fresh hidraw node, and a fresh node is
+    # root:root 0600 until udev gets to it. Counting per device let three
+    # different nodes, each caught inside its own short window, add up to a
+    # verdict about a device whose entries were readable throughout, which is
+    # what produced a report that the reporter's own `ls` contradicted.
     _ACCESS_STRIKES = 3
+
+    def _busy_with_device(self, dev_id):
+        """True while the application itself is driving this device.
+
+        The node churn during an upload is our own doing, so a permission
+        verdict formed in the middle of one says nothing about the
+        installation (#86).
+        """
+        if dev_id != "displaypad":
+            return False
+        panel = getattr(self, "_displaypad_panel", None)
+        if panel is None:
+            return False
+        # Only the upload sessions, which are short and bounded. The device
+        # worker holds its lock for long stretches while it listens for key
+        # presses, so waiting on that would switch this check off for good.
+        return bool(getattr(panel, "_uploading", False)
+                    or getattr(panel, "_animating", False))
 
     def _check_device_access(self, kb_max, kb_60, mouse, dp, mkd=False):
         """Note devices we can see but not open, and say so once (#49).
@@ -1704,26 +1730,45 @@ class App(ctk.CTk):
             ("macropad", mkd, self.MACROPAD_VID, (self.MACROPAD_PID,)),
         )
         for dev_id, present, vid, pids in checks:
+            if present and self._busy_with_device(dev_id):
+                continue              # our own upload is churning the nodes
             denied = []
             if present:
                 for pid in pids:
                     denied.extend(_device_access_denied(vid, pid))
-            if denied:
-                strikes = self._denied_strikes.get(dev_id, 0) + 1
-                self._denied_strikes[dev_id] = strikes
-                if strikes < self._ACCESS_STRIKES:
-                    continue          # still inside the window udev needs
-                self._dev_denied[dev_id] = denied
+            # A set: a device with two product ids can list one node twice,
+            # and a node counted twice per scan reaches the strike count in
+            # two scans instead of three.
+            denied = set(denied)
+            strikes = self._denied_strikes.setdefault(dev_id, {})
+            for node in list(strikes):
+                if node not in denied:
+                    del strikes[node]   # that one came back, forget it
+            for node in denied:
+                strikes[node] = strikes.get(node, 0) + 1
+            persistent = sorted(n for n, c in strikes.items()
+                                if c >= self._ACCESS_STRIKES)
+            if persistent:
+                self._dev_denied[dev_id] = persistent
                 if dev_id not in self._denied_logged:
                     self._denied_logged.add(dev_id)
-                    described = ", ".join(_describe_node(n)
-                                          for n in sorted(denied))
+                    described = ", ".join(_describe_node(n) for n in persistent)
                     print(f"[Device] {dev_id}: no access to {described}. "
                           f"The udev rule is missing or has not been applied; "
                           f"see 'USB permissions' in the README.", flush=True)
+                continue
+            # Nothing has reached the mark on this scan. Two things must not
+            # happen, and they pull opposite ways: a device already known to
+            # be shut must not have its warning taken down and put back up
+            # every time a node changes its number, which a pad that
+            # re-enumerates does often, and the warning must not go on naming
+            # a node that has since gone or become readable. So the warning
+            # stands while anything at all is shut, and names what is shut
+            # now. Before it has been said once, the count still rules.
+            if dev_id in self._denied_logged and denied:
+                self._dev_denied[dev_id] = sorted(denied)
             else:
                 # Access is back: drop the notice at once, no counting down.
-                self._denied_strikes.pop(dev_id, None)
                 self._dev_denied.pop(dev_id, None)
                 self._denied_logged.discard(dev_id)
 
@@ -2005,10 +2050,10 @@ class App(ctk.CTk):
         def _run():
             try:
                 import urllib.request
-                # Scan the recent release feed, not /latest, so that v2.0 can
-                # stay pinned as Latest for new downloaders while small source
-                # patches (2.0.x) still surface here. Picks the release with
-                # the highest version number, skipping drafts + prereleases.
+                # Scan the recent release feed rather than /latest: the
+                # Latest marker is a manual pin and is not necessarily the
+                # highest version. Picks the release with the highest version
+                # number, skipping drafts + prereleases.
                 req = urllib.request.Request(
                     "https://api.github.com/repos/ramisotti13-eng/BaseCamp-Linux/releases?per_page=20",
                     headers={"User-Agent": f"BaseCamp-Linux/{APP_VERSION}"})
@@ -2386,12 +2431,32 @@ class App(ctk.CTk):
         # Signal all background HID threads to stop
         if hasattr(self, "_displaypad_panel"):
             p = self._displaypad_panel
+            # First, so no worker starts opening the device while the rest of
+            # this runs. The <Destroy> binding that stops the plugin worker
+            # only fires inside super().destroy() below, which is after the
+            # wait, and the per-upload worker was never told at all: a thread
+            # still in libusb_open when the interpreter tears down aborts the
+            # process rather than exiting it.
+            if hasattr(p, "_closing"):
+                p._closing.set()
+            if hasattr(p, "_plugin_worker_stop"):
+                p._plugin_worker_stop.set()
             if hasattr(p, "_monitor_stop"):
                 p._monitor_stop.set()
             if hasattr(p, "_key_stop"):
                 p._key_stop.set()
             if hasattr(p, "_anim_stop"):
                 p._anim_stop.set()
+        # The MacroPad's device thread opens the pad in a loop and was never
+        # told to stop, so it kept doing that while the application went away.
+        # It talks hidapi rather than libusb, so it is not the abort the
+        # DisplayPad's worker could cause, but there is no reason to leave it
+        # opening a device nobody is going to read.
+        if hasattr(self, "_macropad_panel"):
+            try:
+                self._macropad_panel._stop_worker()
+            except Exception:
+                pass
         # Stop Everest panel CPU proc if running
         if hasattr(self, "_everest_panel"):
             if hasattr(self, "_everest_panel") and self._everest_panel._cpu_proc \
@@ -2410,6 +2475,15 @@ class App(ctk.CTk):
         # Give HID threads time to close their devices before tearing down
         import time
         time.sleep(0.4)
+        # A fixed wait is a guess, and a worker that started opening the device
+        # just before _closing was set is still inside libusb when it runs out.
+        # The upload worker holds this lock for the whole time it owns the
+        # device, so taking it is proof that nobody is in there any more.
+        # Tearing down while one is aborts the process instead of ending it.
+        p = getattr(self, "_displaypad_panel", None)
+        lock = getattr(p, "_usb_lock", None) if p is not None else None
+        if lock is not None and lock.acquire(timeout=3.0):
+            lock.release()
         super().destroy()
 
 
