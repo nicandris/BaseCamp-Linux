@@ -285,6 +285,13 @@ class EverestMaxPanel(ctk.CTkFrame):
         """Refresh the meters. Runs only while this screen is visible:
         the shell calls refresh() when it is shown and on_hide() when it is
         left, so nothing polls in the background for a screen nobody sees."""
+        # Hiding the window to the tray is not leaving the screen, so no
+        # on_hide() comes, and redrawing the bars on the withdrawn window was
+        # the busiest callback on the Tk thread. Stop here instead;
+        # App._do_window_restore calls refresh(), which starts this again.
+        if self._app.state() != "normal":
+            self._meter_after = None
+            return
         try:
             import psutil, time
             cpu = psutil.cpu_percent(interval=None)

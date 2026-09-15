@@ -18,6 +18,19 @@ import pwd as _pwd
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
+# CustomTkinter (5.2.2) runs two self-rescheduling loops on the Tk root, every
+# 30 ms (appearance) and every 100 ms (DPI), even while the window is in the
+# tray. With the mode set to "dark" above the appearance loop reads nothing,
+# and get_window_dpi_scaling() returns 1 on anything but Windows, so on Linux
+# both loops only wake Tk. Once a second is plenty.
+try:
+    from customtkinter.windows.widgets.appearance_mode.appearance_mode_tracker import AppearanceModeTracker
+    from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
+    if sys.platform.startswith("linux"):
+        AppearanceModeTracker.update_loop_interval = 1000
+        ScalingTracker.update_loop_interval = 1000
+except Exception:
+    pass
 
 _HERE   = os.path.dirname(os.path.abspath(__file__))
 # Deliberately PyInstaller only. A Nuitka build sets __compiled__ instead, but
@@ -2001,6 +2014,14 @@ class App(ctk.CTk):
             self.lift()
         except Exception:
             pass
+        # A screen that polls stops while the window is hidden (the Everest
+        # meters); showing the window counts as showing its screen again.
+        panel = self._panels.get(self._active_device)
+        if panel is not None and hasattr(panel, "refresh"):
+            try:
+                panel.refresh()
+            except Exception as e:
+                print(f"[UI] refresh failed for {self._active_device}: {e}")
 
     def _hide_window(self):
         self._was_withdrawn = True
