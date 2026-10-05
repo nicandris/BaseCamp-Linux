@@ -128,13 +128,19 @@ def _get_claimed_device():
     # Re-find on every try: a handle found while the board is mid
     # re-enumeration (deauthorized, or reset again on a resume) is dead once
     # it comes back, so retrying the claim on it can never succeed.
-    for _ in range(20):
+    for i in range(20):
         try:
-            _claim(dev); return dev
+            _claim(dev)
+            if i:
+                print(f"claimed on try {i + 1}", file=sys.stderr, flush=True)
+            return dev
         except usb.core.USBError:
             usb.util.dispose_resources(dev)
             time.sleep(0.5)
-            dev = usb.core.find(idVendor=VID, idProduct=PID) or dev
+            try:
+                dev = usb.core.find(idVendor=VID, idProduct=PID) or dev
+            except usb.core.USBError:
+                pass  # still settling, as in _reclaim; next try uses the old one
     print("Failed to claim interface", file=sys.stderr); sys.exit(1)
 
 
